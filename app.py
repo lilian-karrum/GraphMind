@@ -1,9 +1,12 @@
-"""GraphMind v1.6 — optimized graph intelligence demo. Data is synthetic."""
+"""GraphMind v1.7 — safeguarded, monitored graph intelligence demo. Data is synthetic."""
 import os
 import re
 import json
 import math
 import time
+import hmac
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import truststore
@@ -12,12 +15,85 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, READ_ACCESS
 
 load_dotenv(Path(__file__).with_name('.env'), override=True)
-DB_NAME = '164000d2'  # Confirmed Aura database; retain the working configuration.
+DB_NAME = '164000d2'  # Preserve the verified Aura database name.
 
 st.set_page_config(page_title='GraphMind | Graph Intelligence Studio', page_icon='◈', layout='wide', initial_sidebar_state='expanded')
+
+# Optional lightweight shared access code. For genuine viewer access control, make
+# the Streamlit Community Cloud app PRIVATE and invite approved viewers instead.
+# APP_ACCESS_PASSWORD is configured only in Streamlit Secrets or a local .env.
+def access_code_matches(entered, expected):
+    return bool(expected) and hmac.compare_digest(str(entered).encode(), str(expected).encode())
+
+def require_app_access():
+    expected = os.getenv('APP_ACCESS_PASSWORD', '')
+    if not expected:
+        return
+    if st.session_state.get('gm_access_granted', False):
+        return
+    st.markdown('## ◈ GraphMind · Access required')
+    st.caption('Enter the private demonstration access code to open the app.')
+    with st.form('gm_login'):
+        supplied = st.text_input('Access code', type='password')
+        submitted = st.form_submit_button('Enter GraphMind')
+    if submitted:
+        if access_code_matches(supplied, expected):
+            st.session_state.gm_access_granted = True
+            st.rerun()
+        else:
+            st.error('Incorrect access code.')
+    st.stop()
+
+require_app_access()
+
+# In-memory API request guard shared by sessions on THIS Streamlit process.
+# It resets after a server restart and does not replace a platform spending cap.
+class ProcessApiBudget:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.day = ''
+        self.used = 0
+
+    def try_claim(self, ceiling):
+        with self.lock:
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            if now != self.day:
+                self.day, self.used = now, 0
+            if self.used >= ceiling:
+                return False
+            self.used += 1
+            return True
+
+@st.cache_resource(show_spinner=False)
+def process_api_budget():
+    return ProcessApiBudget()
+
+def _int_setting(name, default, lower, upper):
+    try:
+        return max(lower, min(upper, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+SESSION_AGENT_LIMIT = _int_setting('MAX_AGENT_RUNS_PER_SESSION', 12, 1, 200)
+PROCESS_DAILY_API_LIMIT = _int_setting('MAX_PROCESS_API_CALLS_PER_DAY', 100, 1, 10000)
+
+def allow_agent_run(state):
+    used = int(state.get('gm_agent_runs', 0))
+    if used >= SESSION_AGENT_LIMIT:
+        return False
+    state['gm_agent_runs'] = used + 1
+    return True
+
+class ApiQuotaExceeded(Exception):
+    """A user-safe quota notification (contains no provider secrets)."""
+
+
+def safe_error(exc):
+    # Avoid exposing any vendor exception text, which may include secrets.
+    return str(exc) if isinstance(exc, ApiQuotaExceeded) else type(exc).__name__
 st.markdown('''<style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
 html,body,[class*="css"],.stApp{font-family:'DM Sans',sans-serif}.stApp{background:#080e1b;color:#eaf1ff}
@@ -38,14 +114,15 @@ EQUIP=[{'id':'E1','name':'Air Conditioner','ratedPowerKW':2.5,'room':'Kitchen'},
 SENSORS=[{'id':f'S{i+1}','name':n,'room':r} for i,(n,r) in enumerate([('Kitchen Power Meter','Kitchen'),('Kitchen Temperature','Kitchen'),('Lab Power Meter','Lab'),('Lab Temperature','Lab'),('Mailroom Power Meter','Mailroom'),('Mailroom Temperature','Mailroom')])]
 ANOM=[{'id':'A1','room':'Kitchen','kind':'High power','observed':2.7,'expected':1.8,'unit':'kW','severity':'High'}, {'id':'A2','room':'Lab','kind':'High power','observed':3.5,'expected':2.9,'unit':'kW','severity':'Medium'}, {'id':'A3','room':'Kitchen','kind':'High temperature','observed':28.,'expected':24.,'unit':'°C','severity':'Medium'}, {'id':'A4','room':'Mailroom','kind':'High power','observed':0.9,'expected':0.7,'unit':'kW','severity':'Low'}]
 QUERIES={
-'equipment':'''MATCH (r:Room)-[:CONTAINS]->(e:Equipment) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN r.name AS room, e.name AS equipment, e.ratedPowerKW AS ratedPowerKW ORDER BY room, equipment''',
-'anomalies':'''MATCH (a:Anomaly)-[:DETECTED_IN]->(r:Room) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN a.id AS id, r.name AS room, a.kind AS kind, a.observed AS observed, a.expected AS expected, a.unit AS unit, a.severity AS severity ORDER BY room, id''',
-'sensors':'''MATCH (r:Room)-[:HAS_SENSOR]->(s:Sensor) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN r.name AS room, s.name AS sensor ORDER BY room, sensor''',
-'powerful':'''MATCH (r:Room)-[:CONTAINS]->(e:Equipment) WHERE e.ratedPowerKW > $threshold RETURN r.name AS room, e.name AS equipment, e.ratedPowerKW AS ratedPowerKW ORDER BY ratedPowerKW DESC''',
-'guidance':'''MATCH (a:Anomaly)-[:DETECTED_IN]->(r:Room) MATCH (a)-[:TRIGGERS]->(rule:Rule) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN a.id AS anomalyId, r.name AS room, a.kind AS anomalyKind, rule.id AS ruleId, rule.name AS rule, rule.description AS guidance ORDER BY room, anomalyId'''
+'equipment':'''MATCH (r:Room)-[:CONTAINS]->(e:Equipment) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN r.name AS room, e.name AS equipment, e.ratedPowerKW AS ratedPowerKW ORDER BY room, equipment LIMIT 150''',
+'anomalies':'''MATCH (a:Anomaly)-[:DETECTED_IN]->(r:Room) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN a.id AS id, r.name AS room, a.kind AS kind, a.observed AS observed, a.expected AS expected, a.unit AS unit, a.severity AS severity ORDER BY room, id LIMIT 150''',
+'sensors':'''MATCH (r:Room)-[:HAS_SENSOR]->(s:Sensor) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN r.name AS room, s.name AS sensor ORDER BY room, sensor LIMIT 150''',
+'powerful':'''MATCH (r:Room)-[:CONTAINS]->(e:Equipment) WHERE e.ratedPowerKW > $threshold RETURN r.name AS room, e.name AS equipment, e.ratedPowerKW AS ratedPowerKW ORDER BY ratedPowerKW DESC LIMIT 150''',
+'guidance':'''MATCH (a:Anomaly)-[:DETECTED_IN]->(r:Room) MATCH (a)-[:TRIGGERS]->(rule:Rule) WHERE ($room = '' OR toLower(r.name) = toLower($room)) RETURN a.id AS anomalyId, r.name AS room, a.kind AS anomalyKind, rule.id AS ruleId, rule.name AS rule, rule.description AS guidance ORDER BY room, anomalyId LIMIT 150'''
 }
 GRAPH_NODES='''MATCH (n) RETURN elementId(n) AS key, labels(n) AS labels, properties(n) AS props ORDER BY key LIMIT 250'''
 GRAPH_EDGES='''MATCH (a)-[r]->(b) RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS relation, properties(r) AS props LIMIT 500'''
+ROOM_LIST_QUERY='''MATCH (r:Room) WHERE r.name IS NOT NULL RETURN DISTINCT r.name AS room ORDER BY room LIMIT 60'''
 DASHBOARD_COUNTS='''MATCH (n)
 RETURN sum(CASE WHEN n:Room THEN 1 ELSE 0 END) AS rooms,
        sum(CASE WHEN n:Equipment THEN 1 ELSE 0 END) AS equipment,
@@ -97,7 +174,7 @@ def get_driver():
 
 
 def _read_neo4j_tool(tool, room='', threshold=2.0):
-    with get_driver().session(database=DB_NAME) as session:
+    with get_driver().session(database=DB_NAME, default_access_mode=READ_ACCESS) as session:
         return [dict(record) for record in session.run(
             QUERIES[tool], room=room, threshold=threshold
         )]
@@ -121,7 +198,7 @@ def run_tool(tool, room='', threshold=2.0, cached=False):
 @st.cache_data(ttl=60, max_entries=4, show_spinner=False)
 def fetch_dashboard_counts():
     """All four dashboard metrics in ONE Cypher query, not three calls."""
-    with get_driver().session(database=DB_NAME) as session:
+    with get_driver().session(database=DB_NAME, default_access_mode=READ_ACCESS) as session:
         record = session.run(DASHBOARD_COUNTS).single()
         if record is None:
             raise RuntimeError('Neo4j returned no dashboard counts')
@@ -130,8 +207,19 @@ def fetch_dashboard_counts():
 
 
 @st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def fetch_room_names():
+    with get_driver().session(database=DB_NAME, default_access_mode=READ_ACCESS) as session:
+        return [row['room'] for row in session.run(ROOM_LIST_QUERY)]
+
+
+def available_rooms():
+    """Dynamic dropdowns after an optional seed extension; demo is unchanged."""
+    return fetch_room_names() if st.session_state.live else [r['name'] for r in ROOMS]
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
 def fetch_live_graph():
-    with get_driver().session(database=DB_NAME) as session:
+    with get_driver().session(database=DB_NAME, default_access_mode=READ_ACCESS) as session:
         nodes = [dict(row) for row in session.run(GRAPH_NODES)]
         edges = [dict(row) for row in session.run(GRAPH_EDGES)]
     return nodes, edges
@@ -142,6 +230,7 @@ def refresh_cached_ui():
     cached_ui_tool.clear()
     fetch_dashboard_counts.clear()
     fetch_live_graph.clear()
+    fetch_room_names.clear()
 
 
 def node_type(n):return n['labels'][0] if n.get('labels') else 'Other'
@@ -224,6 +313,11 @@ def evaluate_history_item(item):
         'Retrieved required types': f'{len(expected & retrieved)}/{len(expected)}' if expected else 'N/A',
         'Missing evidence': ', '.join(sorted(expected - retrieved)) or 'None',
         'Tool success': f'{len(good)}/{len(trace)}' if trace else '0/0',
+        'OpenAI calls': item.get('api_calls', 0),
+        'Input tokens': item.get('input_tokens', 0),
+        'Output tokens': item.get('output_tokens', 0),
+        'AI wait (s)': round(item.get('llm_duration_ms', 0) / 1000, 2),
+        'Graph reads (s)': round(item.get('graph_duration_ms', 0) / 1000, 2),
     }
 
 
@@ -241,8 +335,8 @@ SEED_BENCHMARKS = [
      'expected': ['A1']},
     {'Scenario': 'Equipment rated above 2 kW', 'tool': 'powerful', 'room': '', 'threshold': 2.0,
      'field': 'equipment', 'expected': ['Air Conditioner', 'Server Rack']},
-    {'Scenario': 'Building anomalies', 'tool': 'anomalies', 'room': '', 'field': 'id',
-     'expected': ['A1', 'A2', 'A3', 'A4']},
+    {'Scenario': 'Building anomalies (baseline subset)', 'tool': 'anomalies', 'room': '', 'field': 'id',
+     'expected': ['A1', 'A2', 'A3', 'A4'], 'allow_extra': True},
 ]
 
 
@@ -256,11 +350,11 @@ def run_seed_benchmarks():
                             threshold=check.get('threshold', 2.0))
             got = sorted(str(r.get(check['field'], '')) for r in rows)
             want = sorted(check['expected'])
-            passed = got == want
-            reason = 'Matches known seed' if passed else f'Expected {want}; obtained {got}'
+            passed = set(want).issubset(set(got)) if check.get('allow_extra') else got == want
+            reason = ('Baseline subset present' if check.get('allow_extra') else 'Matches known seed') if passed else f'Expected {want}; obtained {got}'
         except Exception as exc:
             passed = False
-            reason = f'{type(exc).__name__}: {exc}'
+            reason = safe_error(exc)
             got = []
         output.append({'Scenario': check['Scenario'], 'Status': 'PASS' if passed else 'CHECK',
                        'Expected values': ', '.join(check['expected']), 'Returned values': ', '.join(got),
@@ -336,47 +430,58 @@ def graph_figure(nodes,edges,visible_types,show_edge_labels,highlight_nodes=None
 # Session-scoped conversational memory. Previous turns provide *context*, never
 # substitute for fresh Neo4j evidence. No chat history is persisted to the DB.
 # ---------------------------------------------------------------------------
-def explicit_room(text):
-    """Return the most recently mentioned known room in a question."""
-    matches = list(re.finditer(r"\b(Kitchen|Lab|Mailroom)\b", str(text), flags=re.IGNORECASE))
-    return matches[-1].group(1).title() if matches else ''
+def _room_matcher(room_names=None):
+    names = list(room_names or [r['name'] for r in ROOMS])
+    if not names:
+        return None
+    # Longest-first ensures multiword room names take precedence.
+    return re.compile(r'\b(?:' + '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+                      + r')\b', flags=re.IGNORECASE)
 
 
-def last_conversation_room(history):
+def explicit_room(text, room_names=None):
+    """Most recently named room; supports optional additional Aura rooms."""
+    matcher = _room_matcher(room_names)
+    matches = list(matcher.finditer(str(text))) if matcher else []
+    if not matches:
+        return ''
+    names = list(room_names or [r['name'] for r in ROOMS])
+    return next((n for n in names if n.lower() == matches[-1].group().lower()), '')
+
+
+def last_conversation_room(history, room_names=None):
     for turn in reversed(history[-12:]):
-        found = explicit_room(turn.get('resolved_question') or turn.get('question', ''))
+        found = explicit_room(turn.get('resolved_question') or turn.get('question', ''), room_names)
         if found:
             return found
     return ''
 
 
-def resolve_followup_question(question, history):
-    """Resolve common short follow-ups without changing the displayed user text.
-
-    'What about the Lab?' repeats the preceding task for Lab; 'What about
-    its sensors?' uses the previously discussed room. No stored source data is
-    claimed to be new measurement evidence.
-    """
+def resolve_followup_question(question, history, room_names=None):
+    """Resolve short follow-ups. Each resolved question must still requery Neo4j."""
     text = str(question).strip()
     if not text or not history:
         return text
     previous = (history[-1].get('resolved_question') or history[-1].get('question') or '').strip()
-    prior_room = explicit_room(previous) or last_conversation_room(history)
-    room = explicit_room(text)
+    names = list(room_names or [r['name'] for r in ROOMS])
+    matcher = _room_matcher(names)
+    prior_room = explicit_room(previous, names) or last_conversation_room(history, names)
+    room = explicit_room(text, names)
+    rooms_re = '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))
     short_room = re.fullmatch(
         r'\s*(?:and|what about|how about|what about in|how about in|same for|same question for)'
-        r'\s+(?:the\s+)?(Kitchen|Lab|Mailroom)\s*[?.!]*\s*',
+        r'\s+(?:the\s+)?(' + rooms_re + r')\s*[?.!]*\s*',
         text, flags=re.IGNORECASE,
-    )
+    ) if rooms_re else None
     if short_room:
-        new_room = short_room.group(1).title()
-        if previous and explicit_room(previous):
-            return re.sub(r'\b(Kitchen|Lab|Mailroom)\b', new_room, previous, flags=re.IGNORECASE)
+        new_room = next((n for n in names if n.lower() == short_room.group(1).lower()), short_room.group(1))
+        if previous and explicit_room(previous, names) and matcher:
+            return matcher.sub(lambda m: new_room, previous)
         if previous:
             return previous.rstrip(' .?') + ' in ' + new_room + '?'
         return 'Investigate anomalies in the ' + new_room + '.'
     if room:
-        return text  # A newly named room always wins over memory.
+        return text
     if prior_room:
         if re.search(r'\b(?:its|their|there|that room|this room|same room)\b', text,
                      flags=re.IGNORECASE) or re.match(r'^\s*(?:and|what about|how about)\b', text,
@@ -470,7 +575,9 @@ def build_investigation_pdf(item):
     created = datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')
     metadata = [('Generated', created), ('Evidence source', item.get('data_source', 'Unknown')),
                 ('Investigation mode', item.get('mode', 'Unknown')),
-                ('Duration', str(item.get('duration_seconds', 'N/A')) + ' seconds')]
+                ('Duration', str(item.get('duration_seconds', 'N/A')) + ' seconds'),
+                ('OpenAI calls', str(item.get('api_calls', 0))),
+                ('Input / output tokens', f"{item.get('input_tokens', 0)} / {item.get('output_tokens', 0)}")] 
     table = Table([[p(k, small), p(v, body)] for k,v in metadata], colWidths=[122, 382], hAlign='LEFT')
     table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), pale),
                                ('VALIGN', (0,0), (-1,-1), 'TOP'),
@@ -539,7 +646,7 @@ def build_investigation_pdf(item):
 # Read-only side-by-side room comparison using the existing graph retrieval tools.
 # ---------------------------------------------------------------------------
 def room_profile(room):
-    if room not in ('Kitchen', 'Lab', 'Mailroom'):
+    if room not in ([r['name'] for r in ROOMS] if not st.session_state.live else available_rooms()):
         raise ValueError('Unknown room')
     data = {tool: run_tool(tool, room=room, cached=True)
             for tool in ('anomalies', 'equipment', 'sensors', 'guidance')}
@@ -584,8 +691,8 @@ def room_comparison_rows(first, second):
             for name,get in fields]
 
 
-def plan_question(q):
-    lower=q.lower();room=next((r['name'] for r in ROOMS if r['name'].lower() in lower),'')
+def plan_question(q, room_names=None):
+    lower=q.lower();room=explicit_room(q, room_names)
     match=re.search(r'(?:above|over|more than|greater than|exceed(?:s|ing)?)\s*(\d+(?:\.\d+)?)',lower)
     threshold=float(match.group(1)) if match else 2.0
     if any(w in lower for w in ['why','investigat','recommend','explain','cause','should','diagnos']):return ['anomalies','equipment','sensors'],room,threshold
@@ -606,10 +713,10 @@ TOOL_DESCRIPTIONS = {
 }
 
 
-def make_agent_tool(name, description):
+def make_agent_tool(name, description, room_names=None):
     properties = {
         'room': {
-            'type': 'string', 'enum': list(ROOM_OPTIONS),
+            'type': 'string', 'enum': [''] + list(room_names or ROOM_OPTIONS[1:]),
             'description': 'Optional room name; empty string means all rooms.'
         },
         'purpose': {
@@ -632,7 +739,7 @@ def make_agent_tool(name, description):
 
 
 AGENT_TOOLS = [make_agent_tool(name, description) for name, description in TOOL_DESCRIPTIONS.items()]
-MAX_TOOL_CALLS = 6
+MAX_TOOL_CALLS = _int_setting('MAX_TOOL_CALLS', 6, 2, 8)
 
 
 def requested_evidence(question):
@@ -682,14 +789,14 @@ def evidence_preview(tool, records):
     return '; '.join(lines)
 
 
-def parse_agent_arguments(tool_name, raw_arguments):
+def parse_agent_arguments(tool_name, raw_arguments, room_names=None):
     if tool_name not in QUERIES:
         raise ValueError('Unapproved tool')
     args = json.loads(raw_arguments or '{}')
     if not isinstance(args, dict):
         raise ValueError('Tool arguments must be a JSON object')
     room = args.get('room', '')
-    if room not in ROOM_OPTIONS:
+    if room not in ([''] + list(room_names or ROOM_OPTIONS[1:])):
         raise ValueError('Invalid room name')
     purpose = str(args.get('purpose', '')).strip()[:240]
     if not purpose:
@@ -705,12 +812,16 @@ def parse_agent_arguments(tool_name, raw_arguments):
     return room, threshold, purpose, params
 
 
-def agent_investigate(question, prior_turns=None):
+def agent_investigate(question, prior_turns=None, room_names=None):
     """Run sequential, result-aware graph-tool calls (one tool per API round)."""
     from openai import OpenAI
 
     client = OpenAI(api_key=os.environ['OPENAI_API_KEY'], timeout=35.0, max_retries=1)
     model = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
+    agent_tools = [make_agent_tool(name, description, room_names)
+                   for name, description in TOOL_DESCRIPTIONS.items()]
+    usage = {'api_calls': 0, 'input_tokens': 0, 'output_tokens': 0,
+             'llm_duration_ms': 0.0, 'graph_duration_ms': 0.0}
     investigate = is_investigation(question)
     required = requested_evidence(question)
     system = (
@@ -757,23 +868,34 @@ def agent_investigate(question, prior_turns=None):
             messages.append({'role': 'system', 'content':
                 'Required evidence not yet retrieved: ' + ', '.join(sorted(missing)) +
                 '. Choose a missing tool if relevant, unless no tool budget remains.'})
+        if not process_api_budget().try_claim(PROCESS_DAILY_API_LIMIT):
+            raise ApiQuotaExceeded('This demonstration has reached its in-process daily OpenAI request limit. '
+                                   'Try again tomorrow or contact the app owner.')
+        llm_started = time.perf_counter()
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=AGENT_TOOLS,
+            tools=agent_tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
             temperature=0,
+            max_completion_tokens=1000,
         )
+        llm_ms = round((time.perf_counter() - llm_started) * 1000, 1)
+        usage['api_calls'] += 1
+        usage['llm_duration_ms'] += llm_ms
+        api_usage = getattr(response, 'usage', None)
+        usage['input_tokens'] += int(getattr(api_usage, 'prompt_tokens', 0) or 0)
+        usage['output_tokens'] += int(getattr(api_usage, 'completion_tokens', 0) or 0)
         assistant_message = response.choices[0].message
         calls = list(assistant_message.tool_calls or [])
         if not calls:
             if not successes:
-                return 'No graph evidence was retrieved. Please check the connection and retry.', trace
+                return 'No graph evidence was retrieved. Please check the connection and retry.', trace, usage
             answer = assistant_message.content or 'The available graph evidence was retrieved, but no answer was generated.'
             if missing:
                 answer += '\n\n**Evidence limitation:** The investigation did not retrieve: ' + ', '.join(sorted(missing)) + '.'
-            return answer, trace
+            return answer, trace, usage
 
         # This should be one call because parallel_tool_calls=False. If a provider
         # returns more, acknowledge extras as rejected; do not execute them together.
@@ -787,7 +909,7 @@ def agent_investigate(question, prior_turns=None):
         params = {}
         purpose = ''
         try:
-            room, threshold, purpose, params = parse_agent_arguments(name, call.function.arguments)
+            room, threshold, purpose, params = parse_agent_arguments(name, call.function.arguments, room_names)
             signature = (name, room, threshold if name == 'powerful' else None)
             if signature in done:
                 raise ValueError('That exact graph query was already executed. Choose a different check or finish.')
@@ -796,26 +918,28 @@ def agent_investigate(question, prior_turns=None):
             records = run_tool(name, room, threshold)
             tool_ms = round((time.perf_counter() - tool_started) * 1000, 1)
             successes.add(name)
+            usage['graph_duration_ms'] += tool_ms
             preview = evidence_preview(name, records)
             step = {'round': round_number, 'tool': name, 'purpose': purpose,
                     'parameters': params, 'count': len(records), 'records': records,
                     'preview': preview, 'cypher': QUERIES[name], 'error': None,
-                    'tool_duration_ms': tool_ms,
+                    'tool_duration_ms': tool_ms, 'model_duration_ms': llm_ms,
                     'basis': trace[-1].get('preview', '') if trace else ''}
             trace.append(step)
-            payload = {'count': len(records), 'records': records}
+            payload = {'count': len(records), 'records': records[:40],
+                       'truncated_for_model': len(records) > 40}
         except Exception as exc:
-            err = str(exc)
+            err = safe_error(exc)
             trace.append({'round': round_number, 'tool': name, 'purpose': purpose,
                           'parameters': params, 'count': 0, 'records': [],
                           'preview': 'Query not completed.', 'cypher': QUERIES.get(name, ''),
                           'error': err, 'basis': trace[-1].get('preview', '') if trace else '',
-                          'tool_duration_ms': None})
+                          'tool_duration_ms': None, 'model_duration_ms': llm_ms})
             payload = {'error': err}
         messages.append({'role': 'tool', 'tool_call_id': call.id,
                          'content': json.dumps(payload, ensure_ascii=False, default=str)})
 
-    return 'The investigation reached its step limit. Inspect the evidence trace for completed checks.', trace
+    return 'The investigation reached its step limit. Inspect the evidence trace for completed checks.', trace, usage
 
 
 def render_investigation_timeline(item):
@@ -905,7 +1029,7 @@ def queue_question(question):
 
 with st.sidebar:
     st.markdown('## ◈ GRAPHMIND')
-    st.caption('GRAPH INTELLIGENCE STUDIO · v1.6')
+    st.caption('GRAPH INTELLIGENCE STUDIO · v1.7')
     st.divider()
     live_ready=all(os.getenv(x) for x in ['NEO4J_URI','NEO4J_USERNAME','NEO4J_PASSWORD'])
     live=st.toggle('Connect to Neo4j',value=False,disabled=not live_ready,help='Configure .env and run seed.cypher first.')
@@ -933,7 +1057,15 @@ with st.sidebar:
         st.session_state.pop('room_comparison',None)
         st.rerun()
     st.caption('Conversation memory is per browser session; clearing history resets context.')
-    st.divider();st.caption('Designed for teaching · Synthetic records · No physical device control')
+    st.divider()
+    st.caption(f'AI usage in this browser session: {st.session_state.get("gm_agent_runs", 0)}/{SESSION_AGENT_LIMIT} investigations')
+    if os.getenv('APP_ACCESS_PASSWORD'):
+        if st.button('Sign out of demo', width='stretch'):
+            st.session_state.gm_access_granted = False
+            st.rerun()
+    else:
+        st.caption('Access code not configured. Restrict viewers in Streamlit Cloud settings.')
+    st.caption('Designed for teaching · Synthetic records · No physical device control')
 
 st.markdown('''<div class="hero"><div class="eyebrow">NEO4J × KNOWLEDGE GRAPHS × AGENTIC AI</div><h1>Intelligence lives in the connections.</h1><p>Explore a connected building, investigate anomalies, and inspect every retrieval step. An evidence-first graph intelligence demonstration.</p></div>''',unsafe_allow_html=True)
 try:
@@ -943,7 +1075,7 @@ try:
         counts = {'rooms': len(ROOMS), 'equipment': len(EQUIP),
                   'sensors': len(SENSORS), 'anomalies': len(ANOM)}
 except Exception as e:
-    st.error(f'Neo4j connection failed: {e}. Disable live mode or check credentials and database name.');st.stop()
+    st.error(f'Neo4j connection failed ({safe_error(e)}). Check the database name, Streamlit Secrets and Aura status.');st.stop()
 cols=st.columns(4)
 for c,(label,val) in zip(cols,[('ROOMS',counts['rooms']),('EQUIPMENT',counts['equipment']),('SENSORS',counts['sensors']),('ANOMALIES',counts['anomalies'])]):
     with c:st.markdown(f'<div class="metric"><div class="v">{val:02d}</div><div class="l">{label}</div></div>',unsafe_allow_html=True)
@@ -968,7 +1100,7 @@ with tab1:
         try:
             nodes,edges=fetch_live_graph() if live else demo_graph()
         except Exception as e:
-            st.error(f'Could not load graph: {e}')
+            st.error(f'Could not load graph ({safe_error(e)}).')
             st.stop()
         with right:
             st.caption(f'{len(nodes)} nodes · {len(edges)} relationships · database: {DB_NAME if live else "demo"}')
@@ -1081,7 +1213,7 @@ with tab2:
                             with st.spinner('Creating PDF report…'):
                                 st.session_state.report_bytes[index] = build_investigation_pdf(item)
                         except Exception as pdf_exc:
-                            st.error('Could not prepare PDF report: ' + str(pdf_exc))
+                            st.error('Could not prepare PDF report (' + safe_error(pdf_exc) + ').')
                     report_bytes = st.session_state.report_bytes.get(index)
                     if report_bytes:
                         st.download_button('Download PDF investigation report', data=report_bytes,
@@ -1095,13 +1227,20 @@ with tab2:
         if question:
             try:
                 prior_history = list(st.session_state.history)
-                resolved = resolve_followup_question(question, prior_history)
+                rooms_for_question = available_rooms()
+                resolved = resolve_followup_question(question, prior_history, rooms_for_question)
                 investigation_started = time.perf_counter()
+                telemetry = {'api_calls': 0, 'input_tokens': 0, 'output_tokens': 0,
+                             'llm_duration_ms': 0.0, 'graph_duration_ms': 0.0}
                 if ai:
+                    if not allow_agent_run(st.session_state):
+                        raise ApiQuotaExceeded('Session AI investigation limit reached. '
+                                               'Return in a new session or ask the app owner.')
                     with st.spinner('Agent investigating the graph…'):
-                        answer,trace=agent_investigate(resolved, summarize_conversation(prior_history))
+                        answer, trace, telemetry = agent_investigate(
+                            resolved, summarize_conversation(prior_history), rooms_for_question)
                 else:
-                    tools,room,threshold=plan_question(resolved)
+                    tools,room,threshold=plan_question(resolved, rooms_for_question)
                     results={};trace=[]
                     for tool in tools:
                         records=run_tool(tool,room,threshold);results[tool]=records
@@ -1112,12 +1251,12 @@ with tab2:
                     answer=explain(resolved,results,False)
                 total_seconds = round(time.perf_counter() - investigation_started, 3)
                 st.session_state.history.append({'question':question,'resolved_question':resolved,
-                                                 'answer':answer, 'trace':trace,
+                                                 'answer':answer, 'trace':trace, **telemetry,
                                                  'mode':'agent' if ai else 'deterministic',
                                                  'duration_seconds':total_seconds,
                                                  'data_source':'Neo4j Aura' if live else 'Synthetic demo'})
                 st.rerun()
-            except Exception as e:st.error(f'Unable to complete this question: {e}')
+            except Exception as e:st.error(f'Unable to complete this question ({safe_error(e)}).')
 with tab3:
     if tab3.open:
         st.subheader('Inspect the underlying evidence')
@@ -1137,12 +1276,13 @@ with tab_compare:
         st.subheader('Compare two building rooms')
         st.caption('Read-only side-by-side evidence from Neo4j Aura when connected. '
                    'Results may be cached for up to 45 seconds; no OpenAI call is needed.')
+        room_choices = available_rooms()
         with st.form('compare_rooms_form'):
             left_room,right_room=st.columns(2)
             with left_room:
-                room_a=st.selectbox('First room', ['Kitchen', 'Lab', 'Mailroom'],index=0)
+                room_a=st.selectbox('First room', room_choices,index=0)
             with right_room:
-                room_b=st.selectbox('Second room', ['Kitchen', 'Lab', 'Mailroom'],index=1)
+                room_b=st.selectbox('Second room', room_choices,index=min(1, len(room_choices)-1))
             submit_comparison=st.form_submit_button('Compare rooms',type='primary',width='stretch')
         if submit_comparison:
             if room_a==room_b:
@@ -1157,7 +1297,7 @@ with tab_compare:
                             'source':'Neo4j Aura' if live else 'Synthetic demo'
                         }
                 except Exception as exc:
-                    st.error(f'Unable to retrieve comparison: {exc}')
+                    st.error(f'Unable to retrieve comparison ({safe_error(exc)}).')
         comparison=st.session_state.get('room_comparison')
         if comparison:
             if comparison['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
@@ -1213,6 +1353,22 @@ with tab4:
             c.metric('Query success',f'{(total_queries-errors)/total_queries:.0%}' if total_queries else 'N/A')
             d.metric('Mean end-to-end time',f'{sum(complete_duration)/len(complete_duration):.2f} s'
                      if complete_duration else 'N/A')
+            ai_calls = sum(e['OpenAI calls'] for e in entries)
+            i_tokens = sum(e['Input tokens'] for e in entries)
+            o_tokens = sum(e['Output tokens'] for e in entries)
+            t1,t2,t3 = st.columns(3)
+            t1.metric('OpenAI requests (this browser)', ai_calls)
+            t2.metric('Input tokens (reported)', f'{i_tokens:,}')
+            t3.metric('Output tokens (reported)', f'{o_tokens:,}')
+            timing = pd.DataFrame([{'Investigation': f'#{i+1}',
+                                    'AI wait (s)': e['AI wait (s)'],
+                                    'Neo4j reads (s)': e['Graph reads (s)']}
+                                   for i,e in enumerate(entries)])
+            if not timing.empty:
+                st.markdown('#### Where investigation time goes')
+                st.bar_chart(timing.set_index('Investigation'), stack=False)
+                st.caption('AI wait and Neo4j query time are measured components; other '
+                           'work and network overhead account for the rest of elapsed time.')
             st.markdown('#### Recorded questions')
             st.dataframe(pd.DataFrame(entries),hide_index=True,width='stretch')
             st.download_button('Export investigation metrics (CSV)',pd.DataFrame(entries).to_csv(index=False),
@@ -1224,10 +1380,29 @@ with tab4:
             st.info('Run a question in Ask the Agent to populate per-investigation metrics here.')
 
         st.divider()
+        st.markdown('#### Connection health check')
+        st.caption('Run on demand; checks the current Neo4j connection without using OpenAI.')
+        if st.button('Check graph connection', key='check_graph_connection'):
+            started = time.perf_counter()
+            try:
+                if live:
+                    with get_driver().session(database=DB_NAME, default_access_mode=READ_ACCESS) as session:
+                        ok = session.run('RETURN 1 AS healthy').single()
+                    assert ok and ok['healthy'] == 1
+                st.session_state.gm_health = ('Connected to Neo4j Aura' if live else 'Synthetic demo ready',
+                    round((time.perf_counter() - started) * 1000, 1), True)
+            except Exception as error:
+                st.session_state.gm_health = ('Graph health check failed (' + safe_error(error) + ')',
+                    round((time.perf_counter() - started) * 1000, 1), False)
+        if st.session_state.get('gm_health'):
+            health_message, health_time, healthy = st.session_state.gm_health
+            (st.success if healthy else st.error)(f'{health_message} · {health_time:.1f} ms')
+
+        st.divider()
         st.markdown('#### Fixed-seed retrieval benchmarks')
-        st.write('Run six read-only checks against the original smart-building seed. '
-                 'No LLM API calls are used. Results compare exact record identifiers/names '
-                 'with expected values from the known demonstration dataset.')
+        st.write('Run six read-only checks against the known original seed. '
+                 'No LLM API calls are used. Most checks require exact values; the '
+                 'building-wide anomaly check allows additional anomalies after the optional graph extension.')
         if st.button('Run six read-only seed checks',type='primary'):
             with st.spinner('Checking the graph retrieval tools…'):
                 st.session_state.seed_check_results = {
@@ -1249,9 +1424,10 @@ with tab4:
                 st.warning('A mismatch means the loaded data differs from the original seed '
                            'or a retrieval did not complete. Check the Details column.')
         st.caption('Timing depends on local network, OpenAI response time, Neo4j service, and cache state. '
-                   'No repeated trials or statistical confidence intervals are claimed.')
+                   'No repeated trials or statistical confidence intervals are claimed. '
+                   'Request limits are process/session safeguards, not billing guarantees.')
 with tab5:
     if tab5.open:
         st.subheader('How the system works')
-        st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div><div class="panel"><b>07 · Conversational follow-ups</b><div class="small">Session-only question context; each follow-up still queries Neo4j for evidence</div></div><div class="panel"><b>08 · Export and comparison</b><div class="small">Generate PDFs on demand with traceable Cypher, and compare read-only room records using cached UI data</div></div>""",unsafe_allow_html=True)
+        st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div><div class="panel"><b>07 · Conversational follow-ups</b><div class="small">Session-only question context; each follow-up still queries Neo4j for evidence</div></div><div class="panel"><b>08 · Export and comparison</b><div class="small">Generate PDFs on demand with traceable Cypher, and compare read-only room records using cached UI data</div></div><div class="panel"><b>09 · Safe access and API usage</b><div class="small">Optional access code, process-level API request guard, and a per-session investigation quota; configure cloud-level private access and API budgets separately</div></div>""",unsafe_allow_html=True)
         st.warning('Educational limitation: without an API key, the assistant uses deterministic tool routing rather than an LLM. The live graph is read from Neo4j when connected, but the seed data is synthetic. This prototype does not perform live sensor monitoring or device control. Evidence retrieval checks do not establish response correctness or energy savings.')
