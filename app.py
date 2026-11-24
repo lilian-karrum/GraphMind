@@ -1,4 +1,4 @@
-"""GraphMind — graph intelligence demonstration. Bundled records are synthetic."""
+"""GraphMind v1.5 — graph intelligence demonstration. Bundled records are synthetic."""
 import os
 import re
 import json
@@ -277,6 +277,258 @@ def graph_figure(nodes,edges,visible_types,show_edge_labels,highlight_nodes=None
                       legend=dict(orientation='h',y=1.10),dragmode='pan',clickmode='event+select')
     return fig
 
+# ---------------------------------------------------------------------------
+# Session-scoped conversational memory. Previous turns provide *context*, never
+# substitute for fresh Neo4j evidence. No chat history is persisted to the DB.
+# ---------------------------------------------------------------------------
+def explicit_room(text):
+    """Return the most recently mentioned known room in a question."""
+    matches = list(re.finditer(r"\b(Kitchen|Lab|Mailroom)\b", str(text), flags=re.IGNORECASE))
+    return matches[-1].group(1).title() if matches else ''
+
+
+def last_conversation_room(history):
+    for turn in reversed(history[-12:]):
+        found = explicit_room(turn.get('resolved_question') or turn.get('question', ''))
+        if found:
+            return found
+    return ''
+
+
+def resolve_followup_question(question, history):
+    """Resolve common short follow-ups without changing the displayed user text.
+
+    'What about the Lab?' repeats the preceding task for Lab; 'What about
+    its sensors?' uses the previously discussed room. No stored source data is
+    claimed to be new measurement evidence.
+    """
+    text = str(question).strip()
+    if not text or not history:
+        return text
+    previous = (history[-1].get('resolved_question') or history[-1].get('question') or '').strip()
+    prior_room = explicit_room(previous) or last_conversation_room(history)
+    room = explicit_room(text)
+    short_room = re.fullmatch(
+        r'\s*(?:and|what about|how about|what about in|how about in|same for|same question for)'
+        r'\s+(?:the\s+)?(Kitchen|Lab|Mailroom)\s*[?.!]*\s*',
+        text, flags=re.IGNORECASE,
+    )
+    if short_room:
+        new_room = short_room.group(1).title()
+        if previous and explicit_room(previous):
+            return re.sub(r'\b(Kitchen|Lab|Mailroom)\b', new_room, previous, flags=re.IGNORECASE)
+        if previous:
+            return previous.rstrip(' .?') + ' in ' + new_room + '?'
+        return 'Investigate anomalies in the ' + new_room + '.'
+    if room:
+        return text  # A newly named room always wins over memory.
+    if prior_room:
+        if re.search(r'\b(?:its|their|there|that room|this room|same room)\b', text,
+                     flags=re.IGNORECASE) or re.match(r'^\s*(?:and|what about|how about)\b', text,
+                                                   flags=re.IGNORECASE):
+            if re.search(r'\bsensors?\b', text, flags=re.IGNORECASE):
+                return 'Which sensors are in the ' + prior_room + '?'
+            if re.search(r'\b(?:equipment|devices?|appliances?)\b', text, flags=re.IGNORECASE):
+                return 'Which equipment is connected to the ' + prior_room + '?'
+            if re.search(r'\b(?:rules?|guidance|recommendations?)\b', text, flags=re.IGNORECASE):
+                return 'Show the linked investigation rules in the ' + prior_room + '.'
+            if re.search(r'\b(?:anomal(?:y|ies)|problems?|issues?)\b', text, flags=re.IGNORECASE):
+                return 'Show all anomalies in the ' + prior_room + '.'
+            return text.rstrip(' ?.') + ' in the ' + prior_room + '?'
+    return text
+
+
+def summarize_conversation(history, count=4):
+    """Small bounded reference context; answers must still be grounded in NEW tools."""
+    result = []
+    for turn in history[-count:]:
+        trace = turn.get('trace', [])
+        result.append({
+            'user_question': str(turn.get('question', ''))[:350],
+            'interpreted_question': str(turn.get('resolved_question', turn.get('question', '')))[:450],
+            'retrieved_evidence': [
+                {'tool': s.get('tool'), 'summary': str(s.get('preview', ''))[:400]}
+                for s in trace if not s.get('error')
+            ][:5],
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Printable, evidence-grounded report; created in memory, not stored on server.
+# ---------------------------------------------------------------------------
+def build_investigation_pdf(item):
+    """Generate a complete report, including exact executed Cypher, in PDF bytes."""
+    from datetime import datetime, timezone
+    from io import BytesIO
+    from html import escape
+    import textwrap
+    import unicodedata
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                   TableStyle, Preformatted, KeepTogether)
+
+    def pdf_safe(value):
+        # Helvetica works on Streamlit Cloud without shipping any extra font files.
+        # Replace smart glyphs while retaining standard Western-European letters.
+        value = str(value).replace('→', ' -> ').replace('—', ' - ').replace('–', '-')
+        value = value.replace('◈', '').replace('✦', '').replace('▤', '')
+        value = unicodedata.normalize('NFKC', value)
+        return value.encode('latin-1', errors='replace').decode('latin-1')
+
+    def p(text, style):
+        return Paragraph(escape(pdf_safe(text)).replace('\n', '<br/>'), style)
+
+    def rich_line(text, style):
+        import re as _re
+        text = pdf_safe(text).strip()
+        text = _re.sub(r'^#{1,6}\s*', '', text)
+        if text.startswith(('- ', '* ')):
+            text = ' - ' + text[2:]
+        bits = _re.split(r'(\*\*[^*]+\*\*)', text)
+        html = ''.join('<b>' + escape(bit[2:-2]) + '</b>'
+                       if bit.startswith('**') and bit.endswith('**')
+                       else escape(bit) for bit in bits)
+        return Paragraph(html or '&nbsp;', style)
+
+    navy = colors.HexColor('#14243A')
+    teal = colors.HexColor('#087E80')
+    pale = colors.HexColor('#EAF2F6')
+    gray = colors.HexColor('#516071')
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=42, rightMargin=42,
+                            topMargin=59, bottomMargin=48,
+                            title='GraphMind Investigation Report', author='GraphMind')
+    headline = ParagraphStyle('gm_title', fontName='Helvetica-Bold', fontSize=19,
+                              leading=24, textColor=navy, spaceAfter=12)
+    heading = ParagraphStyle('gm_heading', fontName='Helvetica-Bold', fontSize=11,
+                             leading=15, textColor=teal, spaceBefore=13, spaceAfter=6)
+    body = ParagraphStyle('gm_body', fontName='Helvetica', fontSize=9,
+                          leading=13.5, textColor=navy, spaceAfter=5, alignment=TA_LEFT)
+    small = ParagraphStyle('gm_small', parent=body, fontSize=8, leading=11, textColor=gray)
+    code = ParagraphStyle('gm_code', fontName='Courier', fontSize=7.1, leading=10,
+                          backColor=pale, leftIndent=8, rightIndent=8, borderPadding=7)
+    story = [p('GRAPHMIND  |  INVESTIGATION REPORT', headline)]
+    created = datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')
+    metadata = [('Generated', created), ('Evidence source', item.get('data_source', 'Unknown')),
+                ('Investigation mode', item.get('mode', 'Unknown')),
+                ('Duration', str(item.get('duration_seconds', 'N/A')) + ' seconds')]
+    table = Table([[p(k, small), p(v, body)] for k,v in metadata], colWidths=[122, 382], hAlign='LEFT')
+    table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), pale),
+                               ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                               ('BOTTOMPADDING',(0,0),(-1,-1),5),
+                               ('TOPPADDING',(0,0),(-1,-1),5)]))
+    story.extend([table, p('Question', heading), p(item.get('question', ''), body)])
+    interpreted = item.get('resolved_question') or item.get('question', '')
+    if interpreted.strip() != str(item.get('question','')).strip():
+        story.extend([p('Follow-up interpreted as', heading), p(interpreted, body)])
+    story.append(p('Evidence-based answer', heading))
+    for line in str(item.get('answer', '')).splitlines():
+        if line.strip():
+            story.append(rich_line(line, body))
+        else:
+            story.append(Spacer(1, 3))
+    trace = item.get('trace') or []
+    story.append(p('Investigation timeline and Cypher queries', heading))
+    if not trace:
+        story.append(p('No tool calls were recorded.', body))
+    for index, step in enumerate(trace):
+        subhead = f"Round {step.get('round', index + 1)} - {step.get('tool', 'unknown').title()}"
+        story.append(p(subhead, heading))
+        if step.get('purpose'):
+            story.append(p('Objective: ' + str(step['purpose']), body))
+        story.append(p(f"Records: {step.get('count', 0)}  |  Query status: " +
+                       ('Error' if step.get('error') else 'Completed'), small))
+        if step.get('error'):
+            story.append(p('Error: ' + str(step['error']), body))
+        if step.get('basis'):
+            story.append(p('Previous evidence: ' + str(step['basis']), small))
+        story.append(p('Parameters: ' + json.dumps(step.get('parameters', {}), ensure_ascii=True), small))
+        statement = step.get('cypher', '')
+        if statement:
+            wrapped = '\n'.join(textwrap.wrap(pdf_safe(statement), width=84,
+                                                break_long_words=True, break_on_hyphens=False))
+            story.append(Preformatted(wrapped, code))
+        records = step.get('records', [])
+        # Cap excessive evidence to keep exported files manageable and clear.
+        for row in records[:50]:
+            row_text = json.dumps(row, ensure_ascii=True, default=str)
+            story.append(p(row_text, small))
+        if len(records) > 50:
+            story.append(p(f'{len(records)-50} additional rows omitted from PDF; view the app trace.', small))
+    story.extend([p('Limitations', heading),
+                  p('Records are synthetic demonstration data, even when loaded from live Neo4j Aura. '
+                    'Equipment rated power is not measured consumption. Sensor names are not current sensor readings. '
+                    'Room anomalies do not prove a specific appliance caused them. '
+                    'This report documents retrieved graph evidence, not real-world energy savings or device control.', body)])
+
+    def page_footer(canvas, doc):
+        canvas.saveState()
+        width, _ = A4
+        canvas.setStrokeColor(colors.HexColor('#D7E5ED'))
+        canvas.line(42, 38, width - 42, 38)
+        canvas.setFont('Helvetica', 8)
+        canvas.setFillColor(gray)
+        canvas.drawString(42, 26, 'GraphMind | Teaching prototype | Synthetic evidence')
+        canvas.drawRightString(width - 42, 26, f'Page {doc.page}')
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Read-only side-by-side room comparison using the existing graph retrieval tools.
+# ---------------------------------------------------------------------------
+def room_profile(room):
+    if room not in ('Kitchen', 'Lab', 'Mailroom'):
+        raise ValueError('Unknown room')
+    data = {tool: run_tool(tool, room=room)
+            for tool in ('anomalies', 'equipment', 'sensors', 'guidance')}
+    anomalies = data['anomalies']
+    scores = {'High': 3, 'Medium': 2, 'Low': 1}
+    peak_rank = max((scores.get(str(a.get('severity','')),0) for a in anomalies), default=0)
+    peak_label = next((name for name, value in scores.items() if value==peak_rank), 'None')
+    rated_kw = sum(float(item.get('ratedPowerKW') or 0) for item in data['equipment'])
+    data.update({'room': room, 'peak_rank': peak_rank, 'peak_severity': peak_label,
+                 'rated_total_kw': round(rated_kw, 2),
+                 'high_anomaly_count': sum(a.get('severity')=='High' for a in anomalies)})
+    return data
+
+
+def compare_room_profiles(first, second):
+    """A transparent label-based priority cue, not a causal or safety assessment."""
+    if first['peak_rank'] > second['peak_rank']:
+        return (f"{first['room']} has the higher recorded anomaly severity "
+                f"({first['peak_severity']} vs {second['peak_severity']}).")
+    if second['peak_rank'] > first['peak_rank']:
+        return (f"{second['room']} has the higher recorded anomaly severity "
+                f"({second['peak_severity']} vs {first['peak_severity']}).")
+    if len(first['anomalies']) != len(second['anomalies']):
+        bigger = first if len(first['anomalies']) > len(second['anomalies']) else second
+        return (f"Both rooms have the same peak severity ({first['peak_severity']}). "
+                f"{bigger['room']} has more recorded anomalies.")
+    return ('Both rooms have the same highest severity and anomaly count. '
+            'Neither has a clear priority based on these labels alone.')
+
+
+def room_comparison_rows(first, second):
+    fields = [
+        ('Recorded anomalies', lambda p: len(p['anomalies'])),
+        ('High-severity anomalies', lambda p: p['high_anomaly_count']),
+        ('Highest recorded severity', lambda p: p['peak_severity']),
+        ('Connected equipment', lambda p: len(p['equipment'])),
+        ('Sum of nameplate ratings (kW)', lambda p: p['rated_total_kw']),
+        ('Available sensors', lambda p: len(p['sensors'])),
+        ('Linked rules', lambda p: len(p['guidance'])),
+    ]
+    return [{'Metric': name, first['room']: get(first), second['room']: get(second)}
+            for name,get in fields]
+
+
 def plan_question(q):
     lower=q.lower();room=next((r['name'] for r in ROOMS if r['name'].lower() in lower),'')
     match=re.search(r'(?:above|over|more than|greater than|exceed(?:s|ing)?)\s*(\d+(?:\.\d+)?)',lower)
@@ -398,7 +650,7 @@ def parse_agent_arguments(tool_name, raw_arguments):
     return room, threshold, purpose, params
 
 
-def agent_investigate(question):
+def agent_investigate(question, prior_turns=None):
     """Run sequential, result-aware graph-tool calls (one tool per API round)."""
     from openai import OpenAI
 
@@ -420,9 +672,17 @@ def agent_investigate(question):
         'A room anomaly does not prove any specific device caused it. '
         'When evidence is incomplete, explain what measurements would be needed to conclude causation. '
         'Never claim physical equipment was controlled. Cite actual anomaly IDs and device names when available. '
+        'When asked to compare two named rooms, retrieve relevant evidence for BOTH rooms or clearly state gaps. '
         'After obtaining the relevant evidence, give a readable answer with practical, safe verification steps.'
     )
-    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': question}]
+    messages = [{'role': 'system', 'content': system}]
+    if prior_turns:
+        messages.append({'role': 'system', 'content':
+            'Conversation context for resolving references ONLY. Do not use previous results '
+            'as evidence for this turn; re-query relevant tools. Current explicit '
+            'room overrides any earlier room. Recent turns: ' +
+            json.dumps(prior_turns[-4:], ensure_ascii=False, default=str)})
+    messages.append({'role': 'user', 'content': question})
     trace = []
     done = set()
     successes = set()
@@ -578,7 +838,7 @@ def explain(q,results,agent_enabled):
 
 with st.sidebar:
     st.markdown('## ◈ GRAPHMIND')
-    st.caption('GRAPH INTELLIGENCE STUDIO · v1.4')
+    st.caption('GRAPH INTELLIGENCE STUDIO · v1.5')
     st.divider()
     live_ready=all(os.getenv(x) for x in ['NEO4J_URI','NEO4J_USERNAME','NEO4J_PASSWORD'])
     live=st.toggle('Connect to Neo4j',value=False,disabled=not live_ready,help='Configure .env and run seed.cypher first.')
@@ -598,10 +858,11 @@ with st.sidebar:
     ]
     for i,p in enumerate(prompts):
         if st.button(p,key=f'prompt{i}',width='stretch'):st.session_state.pending=p
-    if st.button('Clear investigation history',width='stretch'):
+    if st.button('Clear conversation and investigation history',width='stretch'):
         st.session_state.history=[]
         st.session_state.pop('pending',None)
         st.rerun()
+    st.caption('Conversation memory is per browser session; clearing history resets context.')
     st.divider();st.caption('Designed for teaching · Synthetic records · No physical device control')
 
 st.markdown('''<div class="hero"><div class="eyebrow">NEO4J × KNOWLEDGE GRAPHS × AGENTIC AI</div><h1>Intelligence lives in the connections.</h1><p>Explore a connected building, investigate anomalies, and inspect every retrieval step. An evidence-first graph intelligence demonstration.</p></div>''',unsafe_allow_html=True)
@@ -617,7 +878,10 @@ for c,(label,val) in zip(cols,[('ROOMS',3),('EQUIPMENT',counts['Equipment']),('S
 
 if 'history' not in st.session_state:
     st.session_state.history=[]
-tab1,tab2,tab3,tab4,tab5=st.tabs(['◈  Knowledge Map','✦  Ask the Agent','▤  Data Explorer','◎  Evaluation','◇  Architecture'])
+tab1,tab2,tab3,tab_compare,tab4,tab5=st.tabs([
+    '◈  Knowledge Map', '✦  Ask the Agent', '▤  Data Explorer',
+    '⇄  Compare Rooms', '◎  Evaluation', '◇  Architecture'
+])
 with tab1:
     st.subheader('Interactive building knowledge graph')
     st.caption('Live Neo4j nodes and relationships' if live else
@@ -713,21 +977,39 @@ with tab1:
 with tab2:
     st.subheader('Ask a question. Inspect the evidence.')
     if 'history' not in st.session_state:st.session_state.history=[]
-    for item in st.session_state.history:
-        with st.chat_message('user'):st.write(item['question'])
+    st.caption('Follow-up memory works within this browser session. The agent always retrieves fresh graph '
+               'evidence rather than trusting old answers.')
+    for index,item in enumerate(st.session_state.history):
+        with st.chat_message('user'):
+            st.write(item['question'])
         with st.chat_message('assistant'):
+            interpreted = item.get('resolved_question', item['question'])
+            if interpreted != item['question']:
+                st.caption('Understood follow-up as: ' + interpreted)
             st.markdown(item['answer'])
             render_investigation_timeline(item)
+            with st.expander('Export this investigation as PDF'):
+                try:
+                    report_bytes = build_investigation_pdf(item)
+                    st.download_button('Download PDF investigation report', data=report_bytes,
+                                       file_name=f'GraphMind_Investigation_{index+1}.pdf',
+                                       mime='application/pdf', key=f'report_pdf_{index}',
+                                       width='stretch')
+                    st.caption('Includes the question, answer, rounds, Cypher, parameters and evidence.')
+                except Exception as pdf_exc:
+                    st.error('Could not prepare PDF report: ' + str(pdf_exc))
     question=st.chat_input('Ask about rooms, sensors, anomalies, or energy usage…')
     if st.session_state.get('pending'):question=st.session_state.pop('pending')
     if question:
         try:
+            prior_history = list(st.session_state.history)
+            resolved = resolve_followup_question(question, prior_history)
             investigation_started = time.perf_counter()
             if ai:
                 with st.spinner('Agent investigating the graph…'):
-                    answer,trace=agent_investigate(question)
+                    answer,trace=agent_investigate(resolved, summarize_conversation(prior_history))
             else:
-                tools,room,threshold=plan_question(question)
+                tools,room,threshold=plan_question(resolved)
                 results={};trace=[]
                 for tool in tools:
                     records=run_tool(tool,room,threshold);results[tool]=records
@@ -735,10 +1017,11 @@ with tab2:
                                   'parameters':{'room':room, **({'threshold':threshold} if tool=='powerful' else {})},
                                   'records':records,'round':1,'purpose':'Fixed query selection',
                                   'preview':evidence_preview(tool,records)})
-                answer=explain(question,results,False)
+                answer=explain(resolved,results,False)
             total_seconds = round(time.perf_counter() - investigation_started, 3)
-            st.session_state.history.append({'question':question,'answer':answer,
-                                             'trace':trace,'mode':'agent' if ai else 'deterministic',
+            st.session_state.history.append({'question':question,'resolved_question':resolved,
+                                             'answer':answer, 'trace':trace,
+                                             'mode':'agent' if ai else 'deterministic',
                                              'duration_seconds':total_seconds,
                                              'data_source':'Neo4j Aura' if live else 'Synthetic demo'})
             st.rerun()
@@ -751,6 +1034,68 @@ with tab3:
     st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
     st.markdown('**Parameterized Cypher**');st.code(QUERIES[tool],language='cypher')
     st.download_button('Export table as CSV',pd.DataFrame(rows).to_csv(index=False),file_name=f'{choice.lower()}.csv',mime='text/csv')
+with tab_compare:
+    st.subheader('Compare two building rooms')
+    st.caption('Read-only side-by-side evidence from Neo4j Aura when connected. '
+               'No OpenAI API call is needed for this comparison.')
+    with st.form('compare_rooms_form'):
+        left_room,right_room=st.columns(2)
+        with left_room:
+            room_a=st.selectbox('First room', ['Kitchen', 'Lab', 'Mailroom'],index=0)
+        with right_room:
+            room_b=st.selectbox('Second room', ['Kitchen', 'Lab', 'Mailroom'],index=1)
+        submit_comparison=st.form_submit_button('Compare rooms',type='primary',width='stretch')
+    if submit_comparison:
+        if room_a==room_b:
+            st.warning('Choose two different rooms to compare.')
+        else:
+            try:
+                with st.spinner('Retrieving room evidence from the graph…'):
+                    first=room_profile(room_a)
+                    second=room_profile(room_b)
+                    st.session_state.room_comparison={
+                        'first':first,'second':second,
+                        'source':'Neo4j Aura' if live else 'Synthetic demo'
+                    }
+            except Exception as exc:
+                st.error(f'Unable to retrieve comparison: {exc}')
+    comparison=st.session_state.get('room_comparison')
+    if comparison:
+        if comparison['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
+            st.warning('This comparison used a different data source. Click Compare rooms '
+                       'again to refresh it for the current setting.')
+        first,second=comparison['first'],comparison['second']
+        st.markdown(f"#### {first['room']} vs {second['room']}")
+        metrics=room_comparison_rows(first, second)
+        st.dataframe(pd.DataFrame(metrics),hide_index=True,width='stretch')
+        st.download_button('Export room comparison (CSV)',
+                           data=pd.DataFrame(metrics).to_csv(index=False),
+                           file_name=f"GraphMind_{first['room']}_vs_{second['room']}.csv",
+                           mime='text/csv',key='comparison_csv')
+        st.info(compare_room_profiles(first,second) + ' This is a descriptive comparison of '
+                'synthetic anomaly labels, not a validated safety or energy priority ranking.')
+        st.caption('The sum of rated equipment kW is installed nameplate capacity, '
+                   'NOT actual energy consumption or real-time load.')
+        col_a,col_b=st.columns(2)
+        for col,profile in [(col_a,first),(col_b,second)]:
+            with col:
+                st.markdown(f"##### {profile['room']} evidence")
+                for typ,title in [('anomalies','Anomalies'),('equipment','Equipment'),
+                                  ('sensors','Sensors'),('guidance','Linked rules')]:
+                    with st.expander(f'{title} ({len(profile[typ])})', expanded=(typ=='anomalies')):
+                        if profile[typ]:
+                            st.dataframe(pd.DataFrame(profile[typ]),hide_index=True,width='stretch')
+                        else:
+                            st.caption('No matching records.')
+        if st.button('Ask the agent to explain this comparison',disabled=not ai,
+                     help='Requires Agentic AI investigation to be enabled.'):
+            st.session_state.pending=(f"Compare the anomalies, equipment and sensors in "
+                f"{first['room']} and {second['room']}. Based only on retrieved graph records, "
+                f"explain the differences and uncertainty; do not infer actual device usage.")
+            st.rerun()  # Run the prepared question in Ask the Agent on the next pass.
+    else:
+        st.info('Select two different rooms and click Compare rooms to retrieve their current records.')
+
 with tab4:
     st.subheader('Evidence retrieval evaluation')
     st.caption('Transparent, small-scale verification for a teaching demonstration; '
@@ -805,5 +1150,5 @@ with tab4:
                'No repeated trials or statistical confidence intervals are claimed.')
 with tab5:
     st.subheader('How the system works')
-    st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div>""",unsafe_allow_html=True)
+    st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div><div class="panel"><b>07 · Conversational follow-ups</b><div class="small">Session-only question context; each follow-up still queries Neo4j for evidence</div></div><div class="panel"><b>08 · Export and comparison</b><div class="small">Download PDF reports with traceable Cypher, and compare room records without changing the graph</div></div>""",unsafe_allow_html=True)
     st.warning('Educational limitation: without an API key, the assistant uses deterministic tool routing rather than an LLM. The live graph is read from Neo4j when connected, but the seed data is synthetic. This prototype does not perform live sensor monitoring or device control. Evidence retrieval checks do not establish response correctness or energy savings.')
