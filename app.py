@@ -1,4 +1,4 @@
-"""GraphMind v1.5 — graph intelligence demonstration. Bundled records are synthetic."""
+"""GraphMind v1.6 — optimized graph intelligence demo. Data is synthetic."""
 import os
 import re
 import json
@@ -46,6 +46,14 @@ QUERIES={
 }
 GRAPH_NODES='''MATCH (n) RETURN elementId(n) AS key, labels(n) AS labels, properties(n) AS props ORDER BY key LIMIT 250'''
 GRAPH_EDGES='''MATCH (a)-[r]->(b) RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS relation, properties(r) AS props LIMIT 500'''
+DASHBOARD_COUNTS='''MATCH (n)
+RETURN sum(CASE WHEN n:Room THEN 1 ELSE 0 END) AS rooms,
+       sum(CASE WHEN n:Equipment THEN 1 ELSE 0 END) AS equipment,
+       sum(CASE WHEN n:Sensor THEN 1 ELSE 0 END) AS sensors,
+       sum(CASE WHEN n:Anomaly THEN 1 ELSE 0 END) AS anomalies'''
+# Root-level Streamlit Secrets become environment variables on Streamlit Cloud.
+# Keep secrets in .env locally or in Streamlit Cloud Secrets; never in source control.
+
 COLORS={'Room':'#66e6d4','Equipment':'#8ba9ff','Sensor':'#f2b97b','Anomaly':'#f6a0c4','Rule':'#b9a3ed'}
 
 def demo_query(tool,room='',threshold=2.0):
@@ -73,22 +81,68 @@ def demo_graph():
         if a['kind']=='High power':edges.append({'source':a['id'],'target':'RULE1','relation':'TRIGGERS','props':{}})
     return nodes,edges
 
+@st.cache_resource(show_spinner=False)
 def get_driver():
-    return GraphDatabase.driver(os.environ['NEO4J_URI'],auth=(os.environ['NEO4J_USERNAME'],os.environ['NEO4J_PASSWORD']))
+    """One thread-safe driver, pooled across reruns and all browser sessions.
 
-def run_tool(tool,room='',threshold=2.0):
-    if not st.session_state.live:return demo_query(tool,room,threshold)
-    with get_driver() as driver:
-        with driver.session(database=DB_NAME) as session:
-            return [dict(r) for r in session.run(QUERIES[tool],room=room,threshold=threshold)]
+    A short-lived Neo4j session is still used for each read. On credential
+    changes, restart the Streamlit process to create a fresh driver.
+    """
+    return GraphDatabase.driver(
+        os.environ['NEO4J_URI'],
+        auth=(os.environ['NEO4J_USERNAME'], os.environ['NEO4J_PASSWORD']),
+        max_connection_pool_size=12,
+        connection_timeout=12.0,
+    )
 
-@st.cache_data(ttl=60,show_spinner=False)
+
+def _read_neo4j_tool(tool, room='', threshold=2.0):
+    with get_driver().session(database=DB_NAME) as session:
+        return [dict(record) for record in session.run(
+            QUERIES[tool], room=room, threshold=threshold
+        )]
+
+
+@st.cache_data(ttl=45, max_entries=80, show_spinner=False)
+def cached_ui_tool(tool, room='', threshold=2.0):
+    """Short-term cache for dashboard browsing; never used by the AI agent."""
+    return _read_neo4j_tool(tool, room, threshold)
+
+
+def run_tool(tool, room='', threshold=2.0, cached=False):
+    if not st.session_state.live:
+        return demo_query(tool, room, threshold)
+    if cached:
+        return cached_ui_tool(tool, room, threshold)
+    # AI investigations and evaluation checks always execute fresh queries.
+    return _read_neo4j_tool(tool, room, threshold)
+
+
+@st.cache_data(ttl=60, max_entries=4, show_spinner=False)
+def fetch_dashboard_counts():
+    """All four dashboard metrics in ONE Cypher query, not three calls."""
+    with get_driver().session(database=DB_NAME) as session:
+        record = session.run(DASHBOARD_COUNTS).single()
+        if record is None:
+            raise RuntimeError('Neo4j returned no dashboard counts')
+        return {key: int(record[key]) for key in
+                ('rooms', 'equipment', 'sensors', 'anomalies')}
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
 def fetch_live_graph():
-    with get_driver() as driver:
-        with driver.session(database=DB_NAME) as session:
-            nodes=[dict(x) for x in session.run(GRAPH_NODES)]
-            edges=[dict(x) for x in session.run(GRAPH_EDGES)]
-    return nodes,edges
+    with get_driver().session(database=DB_NAME) as session:
+        nodes = [dict(row) for row in session.run(GRAPH_NODES)]
+        edges = [dict(row) for row in session.run(GRAPH_EDGES)]
+    return nodes, edges
+
+
+def refresh_cached_ui():
+    """Explicit refresh invalidates only short-term read caches."""
+    cached_ui_tool.clear()
+    fetch_dashboard_counts.clear()
+    fetch_live_graph.clear()
+
 
 def node_type(n):return n['labels'][0] if n.get('labels') else 'Other'
 def node_label(n):
@@ -215,6 +269,7 @@ def run_seed_benchmarks():
     return output
 
 
+@st.cache_data(ttl=180, max_entries=48, show_spinner=False)
 def graph_figure(nodes,edges,visible_types,show_edge_labels,highlight_nodes=None,highlight_edges=None):
     # Stable, grouped circular layout. All coordinates are computed from retrieved nodes/edges.
     # Room nodes are central; other nodes are arranged around the room they connect to.
@@ -486,7 +541,7 @@ def build_investigation_pdf(item):
 def room_profile(room):
     if room not in ('Kitchen', 'Lab', 'Mailroom'):
         raise ValueError('Unknown room')
-    data = {tool: run_tool(tool, room=room)
+    data = {tool: run_tool(tool, room=room, cached=True)
             for tool in ('anomalies', 'equipment', 'sensors', 'guidance')}
     anomalies = data['anomalies']
     scores = {'High': 3, 'Medium': 2, 'Low': 1}
@@ -836,9 +891,21 @@ def explain(q,results,agent_enabled):
     lines.append('*Demonstration data only. This response uses transparent rule-based tool routing, not LLM planning.*')
     return '\n\n'.join(lines)
 
+TAB_LABELS = [
+    '◈  Knowledge Map', '✦  Ask the Agent', '▤  Data Explorer',
+    '⇄  Compare Rooms', '◎  Evaluation', '◇  Architecture',
+]
+
+
+def queue_question(question):
+    """Callback executes before widgets are drawn, so it can switch tabs."""
+    st.session_state.pending = question
+    st.session_state['graphmind_active_tab'] = TAB_LABELS[1]
+
+
 with st.sidebar:
     st.markdown('## ◈ GRAPHMIND')
-    st.caption('GRAPH INTELLIGENCE STUDIO · v1.5')
+    st.caption('GRAPH INTELLIGENCE STUDIO · v1.6')
     st.divider()
     live_ready=all(os.getenv(x) for x in ['NEO4J_URI','NEO4J_USERNAME','NEO4J_PASSWORD'])
     live=st.toggle('Connect to Neo4j',value=False,disabled=not live_ready,help='Configure .env and run seed.cypher first.')
@@ -857,10 +924,13 @@ with st.sidebar:
         'Investigate the Kitchen anomaly: check anomalies, equipment, sensors, and linked rules.',
     ]
     for i,p in enumerate(prompts):
-        if st.button(p,key=f'prompt{i}',width='stretch'):st.session_state.pending=p
+        st.button(p, key=f'prompt{i}', width='stretch',
+                  on_click=queue_question, args=(p,))
     if st.button('Clear conversation and investigation history',width='stretch'):
         st.session_state.history=[]
         st.session_state.pop('pending',None)
+        st.session_state.pop('report_bytes',None)
+        st.session_state.pop('room_comparison',None)
         st.rerun()
     st.caption('Conversation memory is per browser session; clearing history resets context.')
     st.divider();st.caption('Designed for teaching · Synthetic records · No physical device control')
@@ -868,287 +938,320 @@ with st.sidebar:
 st.markdown('''<div class="hero"><div class="eyebrow">NEO4J × KNOWLEDGE GRAPHS × AGENTIC AI</div><h1>Intelligence lives in the connections.</h1><p>Explore a connected building, investigate anomalies, and inspect every retrieval step. An evidence-first graph intelligence demonstration.</p></div>''',unsafe_allow_html=True)
 try:
     if live:
-        counts={name:len(run_tool(tool)) for name,tool in [('Equipment','equipment'),('Sensors','sensors'),('Anomalies','anomalies')]}
-    else:counts={'Equipment':len(EQUIP),'Sensors':len(SENSORS),'Anomalies':len(ANOM)}
+        counts = fetch_dashboard_counts()
+    else:
+        counts = {'rooms': len(ROOMS), 'equipment': len(EQUIP),
+                  'sensors': len(SENSORS), 'anomalies': len(ANOM)}
 except Exception as e:
     st.error(f'Neo4j connection failed: {e}. Disable live mode or check credentials and database name.');st.stop()
 cols=st.columns(4)
-for c,(label,val) in zip(cols,[('ROOMS',3),('EQUIPMENT',counts['Equipment']),('SENSORS',counts['Sensors']),('ANOMALIES',counts['Anomalies'])]):
+for c,(label,val) in zip(cols,[('ROOMS',counts['rooms']),('EQUIPMENT',counts['equipment']),('SENSORS',counts['sensors']),('ANOMALIES',counts['anomalies'])]):
     with c:st.markdown(f'<div class="metric"><div class="v">{val:02d}</div><div class="l">{label}</div></div>',unsafe_allow_html=True)
 
 if 'history' not in st.session_state:
     st.session_state.history=[]
-tab1,tab2,tab3,tab_compare,tab4,tab5=st.tabs([
-    '◈  Knowledge Map', '✦  Ask the Agent', '▤  Data Explorer',
-    '⇄  Compare Rooms', '◎  Evaluation', '◇  Architecture'
-])
+# Streamlit 1.55+ supports lazy tab rendering. Only the selected tab is
+# executed, avoiding extra graph redraws, data fetches and PDF generation.
+tab1,tab2,tab3,tab_compare,tab4,tab5 = st.tabs(
+    TAB_LABELS, key='graphmind_active_tab', on_change='rerun'
+)
 with tab1:
-    st.subheader('Interactive building knowledge graph')
-    st.caption('Live Neo4j nodes and relationships' if live else
-               'Bundled synthetic demonstration graph — enable Neo4j to retrieve Aura data')
-    left,right=st.columns([1,1])
-    with left:
-        if st.button('↻ Refresh graph',disabled=not live):
-            fetch_live_graph.clear()
-            st.rerun()
-    try:
-        nodes,edges=fetch_live_graph() if live else demo_graph()
-    except Exception as e:
-        st.error(f'Could not load graph: {e}')
-        st.stop()
-    with right:
-        st.caption(f'{len(nodes)} nodes · {len(edges)} relationships · database: {DB_NAME if live else "demo"}')
-
-    history = st.session_state.history
-    eligible = [(i, h) for i,h in enumerate(history) if any(step.get('records') for step in h.get('trace', []))]
-    options = ['Whole graph (no highlights)'] + [
-        f'Investigation {i+1}: {h["question"][:78]}' for i,h in eligible
-    ]
-    default_index = len(options)-1 if len(options)>1 else 0
-    # A newly completed investigation is spotlighted automatically. Afterwards,
-    # let the presenter choose any previous investigation or the whole graph.
-    if st.session_state.get('_focus_options_count') != len(options):
-        st.session_state.map_focus = options[default_index]
-        st.session_state['_focus_options_count'] = len(options)
-    selected_focus = st.selectbox('Highlight a recorded investigation', options,
-                                  index=default_index, key='map_focus')
-    focus_trace = []
-    if selected_focus != options[0]:
-        pick = options.index(selected_focus)-1
-        focus_item = eligible[pick][1]
-        focus_steps = focus_item['trace']
-        max_round = max(step.get('round',1) for step in focus_steps)
-        if st.session_state.get('_last_graph_focus') != selected_focus:
-            st.session_state.evidence_round = max_round
-            st.session_state['_last_graph_focus'] = selected_focus
-        if max_round > 1:
-            through_round = st.slider('Evidence accumulated through round', min_value=1,
-                                      max_value=max_round, value=max_round, key='evidence_round')
-        else:
-            through_round = 1
-            st.caption('Single-round retrieval: all evidence shown.')
-        focus_trace = [step for step in focus_steps if step.get('round',1) <= through_round]
-        if focus_item.get('data_source') != ('Neo4j Aura' if live else 'Synthetic demo'):
-            st.warning('This investigation used a different source from the graph currently displayed. '
-                       'The highlighted matches may not represent identical records.')
-        st.caption('Only evidence actually returned by selected graph queries is highlighted. '
-                   'Gold connections are retrieved graph relationships, not causal links.')
-    highlight_nodes,highlight_edges,unmatched = graph_evidence_path(nodes, edges, focus_trace)
-    if focus_trace:
-        a,b,c=st.columns(3)
-        a.metric('Evidence nodes',len(highlight_nodes))
-        b.metric('Evidence relationships',len(highlight_edges))
-        c.metric('Queries shown',len(focus_trace))
-        if unmatched:
-            st.warning(f'{unmatched} expected graph relationship(s) could not be matched to this map. '
-                       'Refresh the graph if the database was edited after the investigation.')
-    ctrl_a,ctrl_b=st.columns([2,1])
-    types=[t for t in COLORS if any(node_type(n)==t for n in nodes)]
-    with ctrl_a:
-        selected_types=st.multiselect('Show node types',options=types,default=types)
-    with ctrl_b:
-        show_edge_labels=st.checkbox('Show relationship names',value=False)
-    fig=graph_figure(nodes,edges,selected_types,show_edge_labels,
-                     highlight_nodes=highlight_nodes,highlight_edges=highlight_edges)
-    event=st.plotly_chart(fig,width='stretch',on_select='rerun',selection_mode='points',key='knowledge_graph')
-    selected_key=None
-    if event and event.selection and event.selection.points:
-        selected_key=event.selection.points[0].get('customdata')
-        if isinstance(selected_key,list):
-            selected_key=selected_key[0] if selected_key else None
-    if selected_key is not None:
-        selected_node=next((n for n in nodes if n['key']==selected_key),None)
-        if selected_node:
-            st.markdown(f"### {node_label(selected_node)}")
-            st.caption('Node type: '+node_type(selected_node))
-            st.json(selected_node['props'])
-            by_key={n['key']:n for n in nodes}
-            linked=[{'relationship':e['relation'],'from':node_label(by_key[e['source']]),
-                     'to':node_label(by_key[e['target']])}
-                    for e in edges if (e['source']==selected_key or e['target']==selected_key)
-                    and e['source'] in by_key and e['target'] in by_key]
-            if linked:
-                st.dataframe(pd.DataFrame(linked),hide_index=True,width='stretch')
-    else:
-        st.info('Click a node to inspect its properties. Choose an investigation above to highlight '
-                'its evidence; use the round slider to replay its retrieval path.')
-    st.caption('Room —CONTAINS→ Equipment · Room —HAS_SENSOR→ Sensor · '
-               'Anomaly —DETECTED_IN→ Room · Anomaly —TRIGGERS→ Rule')
-with tab2:
-    st.subheader('Ask a question. Inspect the evidence.')
-    if 'history' not in st.session_state:st.session_state.history=[]
-    st.caption('Follow-up memory works within this browser session. The agent always retrieves fresh graph '
-               'evidence rather than trusting old answers.')
-    for index,item in enumerate(st.session_state.history):
-        with st.chat_message('user'):
-            st.write(item['question'])
-        with st.chat_message('assistant'):
-            interpreted = item.get('resolved_question', item['question'])
-            if interpreted != item['question']:
-                st.caption('Understood follow-up as: ' + interpreted)
-            st.markdown(item['answer'])
-            render_investigation_timeline(item)
-            with st.expander('Export this investigation as PDF'):
-                try:
-                    report_bytes = build_investigation_pdf(item)
-                    st.download_button('Download PDF investigation report', data=report_bytes,
-                                       file_name=f'GraphMind_Investigation_{index+1}.pdf',
-                                       mime='application/pdf', key=f'report_pdf_{index}',
-                                       width='stretch')
-                    st.caption('Includes the question, answer, rounds, Cypher, parameters and evidence.')
-                except Exception as pdf_exc:
-                    st.error('Could not prepare PDF report: ' + str(pdf_exc))
-    question=st.chat_input('Ask about rooms, sensors, anomalies, or energy usage…')
-    if st.session_state.get('pending'):question=st.session_state.pop('pending')
-    if question:
+    if tab1.open:
+        st.subheader('Interactive building knowledge graph')
+        st.caption('Live Neo4j nodes and relationships' if live else
+                   'Bundled synthetic demonstration graph — enable Neo4j to retrieve Aura data')
+        left,right=st.columns([1,1])
+        with left:
+            if st.button('↻ Refresh graph',disabled=not live):
+                refresh_cached_ui()
+                st.rerun()
         try:
-            prior_history = list(st.session_state.history)
-            resolved = resolve_followup_question(question, prior_history)
-            investigation_started = time.perf_counter()
-            if ai:
-                with st.spinner('Agent investigating the graph…'):
-                    answer,trace=agent_investigate(resolved, summarize_conversation(prior_history))
+            nodes,edges=fetch_live_graph() if live else demo_graph()
+        except Exception as e:
+            st.error(f'Could not load graph: {e}')
+            st.stop()
+        with right:
+            st.caption(f'{len(nodes)} nodes · {len(edges)} relationships · database: {DB_NAME if live else "demo"}')
+
+        history = st.session_state.history
+        eligible = [(i, h) for i,h in enumerate(history) if any(step.get('records') for step in h.get('trace', []))]
+        options = ['Whole graph (no highlights)'] + [
+            f'Investigation {i+1}: {h["question"][:78]}' for i,h in eligible
+        ]
+        default_index = len(options)-1 if len(options)>1 else 0
+        # A newly completed investigation is spotlighted automatically. Afterwards,
+        # let the presenter choose any previous investigation or the whole graph.
+        if st.session_state.get('_focus_options_count') != len(options):
+            st.session_state.map_focus = options[default_index]
+            st.session_state['_focus_options_count'] = len(options)
+        selected_focus = st.selectbox('Highlight a recorded investigation', options,
+                                      index=default_index, key='map_focus')
+        focus_trace = []
+        if selected_focus != options[0]:
+            pick = options.index(selected_focus)-1
+            focus_item = eligible[pick][1]
+            focus_steps = focus_item['trace']
+            max_round = max(step.get('round',1) for step in focus_steps)
+            if st.session_state.get('_last_graph_focus') != selected_focus:
+                st.session_state.evidence_round = max_round
+                st.session_state['_last_graph_focus'] = selected_focus
+            if max_round > 1:
+                through_round = st.slider('Evidence accumulated through round', min_value=1,
+                                          max_value=max_round, value=max_round, key='evidence_round')
             else:
-                tools,room,threshold=plan_question(resolved)
-                results={};trace=[]
-                for tool in tools:
-                    records=run_tool(tool,room,threshold);results[tool]=records
-                    trace.append({'tool':tool,'count':len(records),'cypher':QUERIES[tool],
-                                  'parameters':{'room':room, **({'threshold':threshold} if tool=='powerful' else {})},
-                                  'records':records,'round':1,'purpose':'Fixed query selection',
-                                  'preview':evidence_preview(tool,records)})
-                answer=explain(resolved,results,False)
-            total_seconds = round(time.perf_counter() - investigation_started, 3)
-            st.session_state.history.append({'question':question,'resolved_question':resolved,
-                                             'answer':answer, 'trace':trace,
-                                             'mode':'agent' if ai else 'deterministic',
-                                             'duration_seconds':total_seconds,
-                                             'data_source':'Neo4j Aura' if live else 'Synthetic demo'})
-            st.rerun()
-        except Exception as e:st.error(f'Unable to complete this question: {e}')
-with tab3:
-    st.subheader('Inspect the underlying evidence')
-    choice=st.selectbox('Dataset',['Equipment','Sensors','Anomalies','Rule Guidance'])
-    tool={'Equipment':'equipment','Sensors':'sensors','Anomalies':'anomalies','Rule Guidance':'guidance'}[choice]
-    rows=run_tool(tool)
-    st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
-    st.markdown('**Parameterized Cypher**');st.code(QUERIES[tool],language='cypher')
-    st.download_button('Export table as CSV',pd.DataFrame(rows).to_csv(index=False),file_name=f'{choice.lower()}.csv',mime='text/csv')
-with tab_compare:
-    st.subheader('Compare two building rooms')
-    st.caption('Read-only side-by-side evidence from Neo4j Aura when connected. '
-               'No OpenAI API call is needed for this comparison.')
-    with st.form('compare_rooms_form'):
-        left_room,right_room=st.columns(2)
-        with left_room:
-            room_a=st.selectbox('First room', ['Kitchen', 'Lab', 'Mailroom'],index=0)
-        with right_room:
-            room_b=st.selectbox('Second room', ['Kitchen', 'Lab', 'Mailroom'],index=1)
-        submit_comparison=st.form_submit_button('Compare rooms',type='primary',width='stretch')
-    if submit_comparison:
-        if room_a==room_b:
-            st.warning('Choose two different rooms to compare.')
+                through_round = 1
+                st.caption('Single-round retrieval: all evidence shown.')
+            focus_trace = [step for step in focus_steps if step.get('round',1) <= through_round]
+            if focus_item.get('data_source') != ('Neo4j Aura' if live else 'Synthetic demo'):
+                st.warning('This investigation used a different source from the graph currently displayed. '
+                           'The highlighted matches may not represent identical records.')
+            st.caption('Only evidence actually returned by selected graph queries is highlighted. '
+                       'Gold connections are retrieved graph relationships, not causal links.')
+        highlight_nodes,highlight_edges,unmatched = graph_evidence_path(nodes, edges, focus_trace)
+        if focus_trace:
+            a,b,c=st.columns(3)
+            a.metric('Evidence nodes',len(highlight_nodes))
+            b.metric('Evidence relationships',len(highlight_edges))
+            c.metric('Queries shown',len(focus_trace))
+            if unmatched:
+                st.warning(f'{unmatched} expected graph relationship(s) could not be matched to this map. '
+                           'Refresh the graph if the database was edited after the investigation.')
+        ctrl_a,ctrl_b=st.columns([2,1])
+        types=[t for t in COLORS if any(node_type(n)==t for n in nodes)]
+        with ctrl_a:
+            selected_types=st.multiselect('Show node types',options=types,default=types)
+        with ctrl_b:
+            show_edge_labels=st.checkbox('Show relationship names',value=False)
+        fig=graph_figure(nodes,edges,selected_types,show_edge_labels,
+                         highlight_nodes=highlight_nodes,highlight_edges=highlight_edges)
+        event=st.plotly_chart(fig,width='stretch',on_select='rerun',selection_mode='points',key='knowledge_graph')
+        selected_key=None
+        if event and event.selection and event.selection.points:
+            selected_key=event.selection.points[0].get('customdata')
+            if isinstance(selected_key,list):
+                selected_key=selected_key[0] if selected_key else None
+        if selected_key is not None:
+            selected_node=next((n for n in nodes if n['key']==selected_key),None)
+            if selected_node:
+                st.markdown(f"### {node_label(selected_node)}")
+                st.caption('Node type: '+node_type(selected_node))
+                st.json(selected_node['props'])
+                by_key={n['key']:n for n in nodes}
+                linked=[{'relationship':e['relation'],'from':node_label(by_key[e['source']]),
+                         'to':node_label(by_key[e['target']])}
+                        for e in edges if (e['source']==selected_key or e['target']==selected_key)
+                        and e['source'] in by_key and e['target'] in by_key]
+                if linked:
+                    st.dataframe(pd.DataFrame(linked),hide_index=True,width='stretch')
         else:
+            st.info('Click a node to inspect its properties. Choose an investigation above to highlight '
+                    'its evidence; use the round slider to replay its retrieval path.')
+        st.caption('Room —CONTAINS→ Equipment · Room —HAS_SENSOR→ Sensor · '
+                   'Anomaly —DETECTED_IN→ Room · Anomaly —TRIGGERS→ Rule')
+with tab2:
+    if tab2.open:
+        st.subheader('Ask a question. Inspect the evidence.')
+        if 'history' not in st.session_state:st.session_state.history=[]
+        st.caption('Follow-up memory works within this browser session. The agent always retrieves fresh graph '
+                   'evidence rather than trusting old answers.')
+        history_length = len(st.session_state.history)
+        if history_length > 4:
+            show_all_history = st.toggle(
+                f'Show all {history_length} investigations (latest 4 shown by default)',
+                value=False, key='expand_investigation_history'
+            )
+        else:
+            show_all_history = True
+        start_index = 0 if show_all_history else max(0, history_length - 4)
+        for index in range(start_index, history_length):
+            item = st.session_state.history[index]
+            with st.chat_message('user'):
+                st.write(item['question'])
+            with st.chat_message('assistant'):
+                interpreted = item.get('resolved_question', item['question'])
+                if interpreted != item['question']:
+                    st.caption('Understood follow-up as: ' + interpreted)
+                st.markdown(item['answer'])
+                render_investigation_timeline(item)
+                with st.expander('Export this investigation as PDF'):
+                    if 'report_bytes' not in st.session_state:
+                        st.session_state.report_bytes = {}
+                    if st.button('Prepare PDF report', key=f'prepare_pdf_{index}'):
+                        try:
+                            with st.spinner('Creating PDF report…'):
+                                st.session_state.report_bytes[index] = build_investigation_pdf(item)
+                        except Exception as pdf_exc:
+                            st.error('Could not prepare PDF report: ' + str(pdf_exc))
+                    report_bytes = st.session_state.report_bytes.get(index)
+                    if report_bytes:
+                        st.download_button('Download PDF investigation report', data=report_bytes,
+                                           file_name=f'GraphMind_Investigation_{index+1}.pdf',
+                                           mime='application/pdf', key=f'report_pdf_{index}',
+                                           width='stretch')
+                    else:
+                        st.caption('Click Prepare PDF when you need to export. Reports are not generated on other clicks.')
+        question=st.chat_input('Ask about rooms, sensors, anomalies, or energy usage…')
+        if st.session_state.get('pending'):question=st.session_state.pop('pending')
+        if question:
             try:
-                with st.spinner('Retrieving room evidence from the graph…'):
-                    first=room_profile(room_a)
-                    second=room_profile(room_b)
-                    st.session_state.room_comparison={
-                        'first':first,'second':second,
-                        'source':'Neo4j Aura' if live else 'Synthetic demo'
-                    }
-            except Exception as exc:
-                st.error(f'Unable to retrieve comparison: {exc}')
-    comparison=st.session_state.get('room_comparison')
-    if comparison:
-        if comparison['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
-            st.warning('This comparison used a different data source. Click Compare rooms '
-                       'again to refresh it for the current setting.')
-        first,second=comparison['first'],comparison['second']
-        st.markdown(f"#### {first['room']} vs {second['room']}")
-        metrics=room_comparison_rows(first, second)
-        st.dataframe(pd.DataFrame(metrics),hide_index=True,width='stretch')
-        st.download_button('Export room comparison (CSV)',
-                           data=pd.DataFrame(metrics).to_csv(index=False),
-                           file_name=f"GraphMind_{first['room']}_vs_{second['room']}.csv",
-                           mime='text/csv',key='comparison_csv')
-        st.info(compare_room_profiles(first,second) + ' This is a descriptive comparison of '
-                'synthetic anomaly labels, not a validated safety or energy priority ranking.')
-        st.caption('The sum of rated equipment kW is installed nameplate capacity, '
-                   'NOT actual energy consumption or real-time load.')
-        col_a,col_b=st.columns(2)
-        for col,profile in [(col_a,first),(col_b,second)]:
-            with col:
-                st.markdown(f"##### {profile['room']} evidence")
-                for typ,title in [('anomalies','Anomalies'),('equipment','Equipment'),
-                                  ('sensors','Sensors'),('guidance','Linked rules')]:
-                    with st.expander(f'{title} ({len(profile[typ])})', expanded=(typ=='anomalies')):
-                        if profile[typ]:
-                            st.dataframe(pd.DataFrame(profile[typ]),hide_index=True,width='stretch')
-                        else:
-                            st.caption('No matching records.')
-        if st.button('Ask the agent to explain this comparison',disabled=not ai,
-                     help='Requires Agentic AI investigation to be enabled.'):
-            st.session_state.pending=(f"Compare the anomalies, equipment and sensors in "
+                prior_history = list(st.session_state.history)
+                resolved = resolve_followup_question(question, prior_history)
+                investigation_started = time.perf_counter()
+                if ai:
+                    with st.spinner('Agent investigating the graph…'):
+                        answer,trace=agent_investigate(resolved, summarize_conversation(prior_history))
+                else:
+                    tools,room,threshold=plan_question(resolved)
+                    results={};trace=[]
+                    for tool in tools:
+                        records=run_tool(tool,room,threshold);results[tool]=records
+                        trace.append({'tool':tool,'count':len(records),'cypher':QUERIES[tool],
+                                      'parameters':{'room':room, **({'threshold':threshold} if tool=='powerful' else {})},
+                                      'records':records,'round':1,'purpose':'Fixed query selection',
+                                      'preview':evidence_preview(tool,records)})
+                    answer=explain(resolved,results,False)
+                total_seconds = round(time.perf_counter() - investigation_started, 3)
+                st.session_state.history.append({'question':question,'resolved_question':resolved,
+                                                 'answer':answer, 'trace':trace,
+                                                 'mode':'agent' if ai else 'deterministic',
+                                                 'duration_seconds':total_seconds,
+                                                 'data_source':'Neo4j Aura' if live else 'Synthetic demo'})
+                st.rerun()
+            except Exception as e:st.error(f'Unable to complete this question: {e}')
+with tab3:
+    if tab3.open:
+        st.subheader('Inspect the underlying evidence')
+        choice=st.selectbox('Dataset',['Equipment','Sensors','Anomalies','Rule Guidance'])
+        tool={'Equipment':'equipment','Sensors':'sensors','Anomalies':'anomalies','Rule Guidance':'guidance'}[choice]
+        if st.button('↻ Refresh explorer data', key='refresh_explorer'):
+            cached_ui_tool.clear()
+            rows = run_tool(tool, cached=False)
+        else:
+            rows = run_tool(tool, cached=True)
+        st.caption('Browsing data is cached for up to 45 seconds; AI investigations and seed checks always query Neo4j directly.')
+        st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
+        st.markdown('**Parameterized Cypher**');st.code(QUERIES[tool],language='cypher')
+        st.download_button('Export table as CSV',pd.DataFrame(rows).to_csv(index=False),file_name=f'{choice.lower()}.csv',mime='text/csv')
+with tab_compare:
+    if tab_compare.open:
+        st.subheader('Compare two building rooms')
+        st.caption('Read-only side-by-side evidence from Neo4j Aura when connected. '
+                   'Results may be cached for up to 45 seconds; no OpenAI call is needed.')
+        with st.form('compare_rooms_form'):
+            left_room,right_room=st.columns(2)
+            with left_room:
+                room_a=st.selectbox('First room', ['Kitchen', 'Lab', 'Mailroom'],index=0)
+            with right_room:
+                room_b=st.selectbox('Second room', ['Kitchen', 'Lab', 'Mailroom'],index=1)
+            submit_comparison=st.form_submit_button('Compare rooms',type='primary',width='stretch')
+        if submit_comparison:
+            if room_a==room_b:
+                st.warning('Choose two different rooms to compare.')
+            else:
+                try:
+                    with st.spinner('Retrieving room evidence from the graph…'):
+                        first=room_profile(room_a)
+                        second=room_profile(room_b)
+                        st.session_state.room_comparison={
+                            'first':first,'second':second,
+                            'source':'Neo4j Aura' if live else 'Synthetic demo'
+                        }
+                except Exception as exc:
+                    st.error(f'Unable to retrieve comparison: {exc}')
+        comparison=st.session_state.get('room_comparison')
+        if comparison:
+            if comparison['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
+                st.warning('This comparison used a different data source. Click Compare rooms '
+                           'again to refresh it for the current setting.')
+            first,second=comparison['first'],comparison['second']
+            st.markdown(f"#### {first['room']} vs {second['room']}")
+            metrics=room_comparison_rows(first, second)
+            st.dataframe(pd.DataFrame(metrics),hide_index=True,width='stretch')
+            st.download_button('Export room comparison (CSV)',
+                               data=pd.DataFrame(metrics).to_csv(index=False),
+                               file_name=f"GraphMind_{first['room']}_vs_{second['room']}.csv",
+                               mime='text/csv',key='comparison_csv')
+            st.info(compare_room_profiles(first,second) + ' This is a descriptive comparison of '
+                    'synthetic anomaly labels, not a validated safety or energy priority ranking.')
+            st.caption('The sum of rated equipment kW is installed nameplate capacity, '
+                       'NOT actual energy consumption or real-time load.')
+            col_a,col_b=st.columns(2)
+            for col,profile in [(col_a,first),(col_b,second)]:
+                with col:
+                    st.markdown(f"##### {profile['room']} evidence")
+                    for typ,title in [('anomalies','Anomalies'),('equipment','Equipment'),
+                                      ('sensors','Sensors'),('guidance','Linked rules')]:
+                        with st.expander(f'{title} ({len(profile[typ])})', expanded=(typ=='anomalies')):
+                            if profile[typ]:
+                                st.dataframe(pd.DataFrame(profile[typ]),hide_index=True,width='stretch')
+                            else:
+                                st.caption('No matching records.')
+            comparison_question = (
+                f"Compare the anomalies, equipment and sensors in "
                 f"{first['room']} and {second['room']}. Based only on retrieved graph records, "
-                f"explain the differences and uncertainty; do not infer actual device usage.")
-            st.rerun()  # Run the prepared question in Ask the Agent on the next pass.
-    else:
-        st.info('Select two different rooms and click Compare rooms to retrieve their current records.')
+                f"explain the differences and uncertainty; do not infer actual device usage."
+            )
+            st.button('Ask the agent to explain this comparison', disabled=not ai,
+                      help='Requires Agentic AI investigation to be enabled.',
+                      on_click=queue_question, args=(comparison_question,))
+        else:
+            st.info('Select two different rooms and click Compare rooms to retrieve their current records.')
 
 with tab4:
-    st.subheader('Evidence retrieval evaluation')
-    st.caption('Transparent, small-scale verification for a teaching demonstration; '
-               'these scores are NOT a measure of natural-language accuracy or actual energy savings.')
-    entries=[evaluate_history_item(h) for h in st.session_state.history]
-    if entries:
-        total_queries=sum(e['Tool calls'] for e in entries)
-        errors=sum(e['Query errors'] for e in entries)
-        complete_duration=[e['Duration (s)'] for e in entries if e['Duration (s)'] is not None]
-        a,b,c,d=st.columns(4)
-        a.metric('Investigations',len(entries))
-        b.metric('Graph tool calls',total_queries)
-        c.metric('Query success',f'{(total_queries-errors)/total_queries:.0%}' if total_queries else 'N/A')
-        d.metric('Mean end-to-end time',f'{sum(complete_duration)/len(complete_duration):.2f} s'
-                 if complete_duration else 'N/A')
-        st.markdown('#### Recorded questions')
-        st.dataframe(pd.DataFrame(entries),hide_index=True,width='stretch')
-        st.download_button('Export investigation metrics (CSV)',pd.DataFrame(entries).to_csv(index=False),
-                           file_name='graphmind_investigation_metrics.csv',mime='text/csv')
-        st.caption('Required-type coverage checks the question for explicit references to anomalies, '
-                   'sensors, equipment, and rules. A retrieved type must contain at least one record. '
-                   'A score of 100% does not prove the answer is factually correct.')
-    else:
-        st.info('Run a question in Ask the Agent to populate per-investigation metrics here.')
+    if tab4.open:
+        st.subheader('Evidence retrieval evaluation')
+        st.caption('Transparent, small-scale verification for a teaching demonstration; '
+                   'these scores are NOT a measure of natural-language accuracy or actual energy savings.')
+        entries=[evaluate_history_item(h) for h in st.session_state.history]
+        if entries:
+            total_queries=sum(e['Tool calls'] for e in entries)
+            errors=sum(e['Query errors'] for e in entries)
+            complete_duration=[e['Duration (s)'] for e in entries if e['Duration (s)'] is not None]
+            a,b,c,d=st.columns(4)
+            a.metric('Investigations',len(entries))
+            b.metric('Graph tool calls',total_queries)
+            c.metric('Query success',f'{(total_queries-errors)/total_queries:.0%}' if total_queries else 'N/A')
+            d.metric('Mean end-to-end time',f'{sum(complete_duration)/len(complete_duration):.2f} s'
+                     if complete_duration else 'N/A')
+            st.markdown('#### Recorded questions')
+            st.dataframe(pd.DataFrame(entries),hide_index=True,width='stretch')
+            st.download_button('Export investigation metrics (CSV)',pd.DataFrame(entries).to_csv(index=False),
+                               file_name='graphmind_investigation_metrics.csv',mime='text/csv')
+            st.caption('Required-type coverage checks the question for explicit references to anomalies, '
+                       'sensors, equipment, and rules. A retrieved type must contain at least one record. '
+                       'A score of 100% does not prove the answer is factually correct.')
+        else:
+            st.info('Run a question in Ask the Agent to populate per-investigation metrics here.')
 
-    st.divider()
-    st.markdown('#### Fixed-seed retrieval benchmarks')
-    st.write('Run six read-only checks against the original smart-building seed. '
-             'No LLM API calls are used. Results compare exact record identifiers/names '
-             'with expected values from the known demonstration dataset.')
-    if st.button('Run six read-only seed checks',type='primary'):
-        with st.spinner('Checking the graph retrieval tools…'):
-            st.session_state.seed_check_results = {
-                'source': 'Neo4j Aura' if live else 'Synthetic demo',
-                'results': run_seed_benchmarks(),
-            }
-    saved=st.session_state.get('seed_check_results')
-    if saved:
-        if saved['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
-            st.warning('These results were generated using a different data source. '
-                       'Run the seed checks again for the current source.')
-        data=saved['results']
-        passed=sum(x['Status']=='PASS' for x in data)
-        st.metric('Seed checks matched',f'{passed}/{len(data)}')
-        st.dataframe(pd.DataFrame(data),hide_index=True,width='stretch')
-        st.download_button('Export seed checks (CSV)',pd.DataFrame(data).to_csv(index=False),
-                           file_name='graphmind_seed_checks.csv',mime='text/csv')
-        if passed != len(data):
-            st.warning('A mismatch means the loaded data differs from the original seed '
-                       'or a retrieval did not complete. Check the Details column.')
-    st.caption('Timing depends on local network, OpenAI response time, Neo4j service, and cache state. '
-               'No repeated trials or statistical confidence intervals are claimed.')
+        st.divider()
+        st.markdown('#### Fixed-seed retrieval benchmarks')
+        st.write('Run six read-only checks against the original smart-building seed. '
+                 'No LLM API calls are used. Results compare exact record identifiers/names '
+                 'with expected values from the known demonstration dataset.')
+        if st.button('Run six read-only seed checks',type='primary'):
+            with st.spinner('Checking the graph retrieval tools…'):
+                st.session_state.seed_check_results = {
+                    'source': 'Neo4j Aura' if live else 'Synthetic demo',
+                    'results': run_seed_benchmarks(),
+                }
+        saved=st.session_state.get('seed_check_results')
+        if saved:
+            if saved['source'] != ('Neo4j Aura' if live else 'Synthetic demo'):
+                st.warning('These results were generated using a different data source. '
+                           'Run the seed checks again for the current source.')
+            data=saved['results']
+            passed=sum(x['Status']=='PASS' for x in data)
+            st.metric('Seed checks matched',f'{passed}/{len(data)}')
+            st.dataframe(pd.DataFrame(data),hide_index=True,width='stretch')
+            st.download_button('Export seed checks (CSV)',pd.DataFrame(data).to_csv(index=False),
+                               file_name='graphmind_seed_checks.csv',mime='text/csv')
+            if passed != len(data):
+                st.warning('A mismatch means the loaded data differs from the original seed '
+                           'or a retrieval did not complete. Check the Details column.')
+        st.caption('Timing depends on local network, OpenAI response time, Neo4j service, and cache state. '
+                   'No repeated trials or statistical confidence intervals are claimed.')
 with tab5:
-    st.subheader('How the system works')
-    st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div><div class="panel"><b>07 · Conversational follow-ups</b><div class="small">Session-only question context; each follow-up still queries Neo4j for evidence</div></div><div class="panel"><b>08 · Export and comparison</b><div class="small">Download PDF reports with traceable Cypher, and compare room records without changing the graph</div></div>""",unsafe_allow_html=True)
-    st.warning('Educational limitation: without an API key, the assistant uses deterministic tool routing rather than an LLM. The live graph is read from Neo4j when connected, but the seed data is synthetic. This prototype does not perform live sensor monitoring or device control. Evidence retrieval checks do not establish response correctness or energy savings.')
+    if tab5.open:
+        st.subheader('How the system works')
+        st.markdown("""<div class="panel"><b>01 · Question</b><div class="small">Natural-language input from the user</div></div><div class="panel"><b>02 · Tool selection</b><div class="small">Deterministic routing by default; sequential, result-aware LLM tool choices when enabled</div></div><div class="panel"><b>03 · Safe graph retrieval</b><div class="small">Only predefined, parameterized, read-only Cypher queries are permitted</div></div><div class="panel"><b>04 · Evidence-based response</b><div class="small">Retrieved records are summarized; no causal claims without measurements</div></div><div class="panel"><b>05 · Investigation path</b><div class="small">Replay rounds and highlight actual graph nodes and relationships used in retrieval</div></div><div class="panel"><b>06 · Auditable evaluation</b><div class="small">Inspect evidence trace, timings, query success and fixed-seed retrieval checks</div></div><div class="panel"><b>07 · Conversational follow-ups</b><div class="small">Session-only question context; each follow-up still queries Neo4j for evidence</div></div><div class="panel"><b>08 · Export and comparison</b><div class="small">Generate PDFs on demand with traceable Cypher, and compare read-only room records using cached UI data</div></div>""",unsafe_allow_html=True)
+        st.warning('Educational limitation: without an API key, the assistant uses deterministic tool routing rather than an LLM. The live graph is read from Neo4j when connected, but the seed data is synthetic. This prototype does not perform live sensor monitoring or device control. Evidence retrieval checks do not establish response correctness or energy savings.')
